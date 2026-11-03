@@ -1,13 +1,30 @@
 import * as THREE from 'three';
 import { MAX_PLATES, StackAnimator, type StackParams } from './cardStack.ts';
 
-const THICKNESS = 0.045;
+/** thin, like a die-cut metal ticket */
+const THICKNESS = 0.02;
 const plateM = new THREE.Matrix4();
 /** the printed face sits a hair proud of the slab, so the two never z-fight */
 const FACE_LIFT = 0.0004;
 const CORNER_SEGMENTS = 10;
 /** a small 45° chamfer where face meets side: the facet that glints as the card turns */
 const CHAMFER = 0.006;
+/** a soft round glow, for the laser's spot */
+function glowTexture() {
+  const c = document.createElement('canvas');
+  c.width = c.height = 64;
+  const g = c.getContext('2d')!;
+  const grad = g.createRadialGradient(32, 32, 0, 32, 32, 32);
+  grad.addColorStop(0, 'rgba(255,255,255,1)');
+  grad.addColorStop(0.2, 'rgba(255,200,140,0.8)');
+  grad.addColorStop(0.5, 'rgba(255,120,40,0.25)');
+  grad.addColorStop(1, 'rgba(255,90,20,0)');
+  g.fillStyle = grad;
+  g.fillRect(0, 0, 64, 64);
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
+}
 
 /** card outline: a rectangle with rounded corners (radius 0 = sharp), centred */
 function cardOutline(width: number, height: number, radius: number) {
@@ -59,8 +76,16 @@ export class MetalCard {
   private front: THREE.MeshPhysicalMaterial;
   private plateFront: THREE.MeshPhysicalMaterial;
   /** a different artwork per plate, cycled through the stack; none = the card's */
+  /** each plate's layer of the plate art: plates show any ticket in the pool, not just their own index */
+  private plateLayer = new THREE.InstancedBufferAttribute(new Float32Array(MAX_PLATES).map((_, i) => i), 1);
   private plateArt = {
     uPlateArt: { value: null as THREE.DataArrayTexture | null },
+    /** the page's marks on every ticket plate (null: none) */
+    uPlateMarks: { value: null as THREE.Texture | null },
+    /** the pulled-out plate's artwork at full size, and the pool layer it stands in for (-1: none) */
+    uFocusArt: { value: null as THREE.Texture | null },
+    uFocusLayer: { value: -1 },
+    uFocusTexel: { value: new THREE.Vector2(1 / 1000, 1 / 1500) },
     uPlateArtCount: { value: 0 },
     uPlateTexel: { value: new THREE.Vector2(1 / 1024, 1 / 1536) },
   };
@@ -77,7 +102,35 @@ export class MetalCard {
     uEtchDepth: { value: 0.5 },
     uEtchBevel: { value: 1 },
     uMapTexel: { value: new THREE.Vector2(1 / 2048, 1 / 3072) },
+    /** a ticket's owner (username and number): 0 ink, 1 mirror, 2 etched; and the ink's colour */
+    uOwnerFinish: { value: 0 },
+    uOwnerInk: { value: new THREE.Color(0.025, 0.025, 0.025) },
   };
+  /** the laser etching the face: on, and how far through (0..1) */
+  private laserU = {
+    uLaserOn: { value: 0 },
+    uLaserP: { value: 0 },
+    /** the pass's route: when the head cuts each cell of the face (see laser.ts) */
+    uLaserPlan: { value: null as THREE.DataTexture | null },
+    uLaserSeconds: { value: 1 },
+    uLaserHead: { value: new THREE.Vector2() },
+    uLaserFiring: { value: 0 },
+    uLaserAspect: { value: 1.5 },
+    /** the face before the laser: its ground with nothing cut in */
+    uLaserGround: { value: null as THREE.Texture | null },
+    /** a ticket's lettering on the card's face, its own layer (its coverage in alpha); off: none */
+    uFaceLettering: { value: null as THREE.Texture | null },
+    /** 0: no lettering; 1: the artwork keeps clear of it; 2: the laser is cutting it; 3: cut through the card */
+    uFaceLetteringOn: { value: 0 },
+    uFaceMarks: { value: null as THREE.Texture | null },
+    uFaceOwner: { value: null as THREE.Texture | null },
+    uFacePlainGround: { value: null as THREE.Texture | null },
+    /** the card's size, for where a slab point sits on the face */
+    uCardSize: { value: new THREE.Vector2(2, 3) },
+  };
+  /** the laser itself: a beam down onto the face, its spot, and the light it throws */
+  private laser = new THREE.Group();
+  private laserLight = new THREE.PointLight('#ff8a3d', 0, 0.9, 2);
   private rot = { x: 0, y: 0 };
   /** an exact angle (and offset) held by the cinematic reel; null = spin and settle */
   private posed: THREE.Euler | null = null;
@@ -97,6 +150,12 @@ export class MetalCard {
       iridescenceThicknessRange: [180, 520],
     });
     this.front.onBeforeCompile = (shader) => this.patchFace(shader, false);
+    // the face always draws over the body it sits a hair above: at a
+    // distance (the long Tiles lens) the depth buffer can't tell them apart,
+    // and they'd fight through each other in blocks
+    this.front.polygonOffset = true;
+    this.front.polygonOffsetFactor = -1;
+    this.front.polygonOffsetUnits = -4;
     // the plates' face: the same, but each plate can carry its own artwork
     this.plateFront = this.front.clone();
     this.plateFront.onBeforeCompile = (shader) => this.patchFace(shader, true);
@@ -109,6 +168,7 @@ export class MetalCard {
       clearcoat: 0.3,
       clearcoatRoughness: 0.3,
     }));
+    metal.onBeforeCompile = (shader) => this.patchSlab(shader);
     // machined edges: square-cut and chamfered, polished metal brushed along the edge
     this.edge = new THREE.MeshPhysicalMaterial({
       color: '#c9ced6',
@@ -123,6 +183,8 @@ export class MetalCard {
     this.face = new THREE.Mesh(new THREE.ShapeGeometry(), this.front);
     this.stackSlab = new THREE.InstancedMesh(this.slab.geometry, [metal, this.edge], MAX_PLATES);
     this.stackFace = new THREE.InstancedMesh(this.face.geometry, this.plateFront, MAX_PLATES);
+    this.slab.geometry.setAttribute('aPlateLayer', this.plateLayer);
+    this.face.geometry.setAttribute('aPlateLayer', this.plateLayer);
     for (const m of [this.stackSlab, this.stackFace]) {
       m.count = 0;
       m.visible = false;
@@ -130,6 +192,8 @@ export class MetalCard {
       m.frustumCulled = false;
     }
     this.group.add(this.slab, this.face, this.stackSlab, this.stackFace);
+    this.buildLaser();
+    this.group.add(this.laser);
     this.group.visible = false;
     this.rebuild();
   }
@@ -138,6 +202,7 @@ export class MetalCard {
   setSize(width: number, height: number) {
     if (width === this.size.w && height === this.size.h) return;
     this.size = { w: width, h: height };
+    this.laserU.uCardSize.value.set(width, height);
     this.rebuild();
   }
 
@@ -199,6 +264,8 @@ export class MetalCard {
     if (this.stackSlab) {
       this.stackSlab.geometry = slab;
       this.stackFace.geometry = face;
+      slab.setAttribute('aPlateLayer', this.plateLayer);
+      face.setAttribute('aPlateLayer', this.plateLayer);
     }
   }
 
@@ -290,6 +357,13 @@ export class MetalCard {
     normal.set(0, 0, 1).transformDirection(plateM);
   }
 
+  /** Plate i's middle, in world space, as it is now. */
+  plateCentre(i: number, out: THREE.Vector3) {
+    this.stackSlab.getMatrixAt(i, plateM);
+    plateM.premultiply(this.group.matrixWorld);
+    return out.setFromMatrixPosition(plateM);
+  }
+
   /** Where a world point lies on plate i, in fractions of the card from its middle. */
   plateUv(i: number, point: THREE.Vector3) {
     this.group.updateWorldMatrix(true, false);
@@ -336,13 +410,56 @@ export class MetalCard {
    * over it. Plates can each take their own artwork (a texture array layer
    * per plate); otherwise they share the card's.
    */
+  /**
+   * The card's body: where a ticket's owner is cut, its front and back go too,
+   * so the letters open right through. A plate reads its cut from its ticket
+   * (the alpha's lower half); the card from the lettering once it's cut through.
+   */
+  private patchSlab(shader: THREE.WebGLProgramParametersWithUniforms) {
+    Object.assign(shader.uniforms, this.plateArt, this.laserU);
+    // the stack's plates (instanced) or the one card — decided here: three.js
+    // only defines USE_INSTANCING for the vertex shader
+    const plates = shader.instancing;
+    shader.vertexShader = shader.vertexShader
+      .replace('#include <common>', `#include <common>
+        uniform vec2 uCardSize;
+        varying vec2 vCardUv;
+        varying float vCap;
+        ${plates ? 'attribute float aPlateLayer;\n        flat varying float vPlate;' : ''}`)
+      .replace('#include <begin_vertex>', `#include <begin_vertex>
+        vCardUv = position.xy / uCardSize + 0.5;
+        vCap = abs(normal.z);
+        ${plates ? 'vPlate = aPlateLayer;' : ''}`);
+    shader.fragmentShader = shader.fragmentShader
+      .replace('#include <common>', `#include <common>
+        varying vec2 vCardUv;
+        varying float vCap;
+        ${plates ? `
+          flat varying float vPlate;
+          uniform highp sampler2DArray uPlateArt;
+          uniform float uPlateArtCount;
+          uniform sampler2D uFocusArt;
+          uniform float uFocusLayer;
+          float slabCut() {
+            if (uPlateArtCount < 0.5) return 0.0;
+            bool focused = uFocusLayer > -0.5 && abs(vPlate - uFocusLayer) < 0.5;
+            return 1.0 - (focused ? texture2D(uFocusArt, vCardUv).a : texture(uPlateArt, vec3(vCardUv, vPlate)).a);
+          }` : `
+          uniform sampler2D uFaceOwner;
+          uniform float uFaceLetteringOn;
+          float slabCut() { return uFaceLetteringOn > 2.5 ? texture2D(uFaceOwner, vCardUv).a : 0.0; }`}`)
+      .replace('#include <clipping_planes_fragment>', `#include <clipping_planes_fragment>
+        // only the flat front and back: the sides stay whole
+        if (vCap > 0.9 && slabCut() > 0.5) discard;`);
+  }
+
   private patchFace(shader: THREE.WebGLProgramParametersWithUniforms, plates: boolean) {
-    Object.assign(shader.uniforms, this.etch, this.plateArt, { uStickerMap: this.stickerMap });
+    Object.assign(shader.uniforms, this.etch, this.plateArt, this.laserU, { uStickerMap: this.stickerMap });
     if (plates) {
-      // each plate's own artwork: a layer of the texture array, by instance
+      // each plate's own artwork: a layer of the texture array, the plate's slot in the pool
       shader.vertexShader = shader.vertexShader
-        .replace('#include <common>', '#include <common>\nflat varying float vPlate;')
-        .replace('#include <begin_vertex>', '#include <begin_vertex>\nvPlate = float(gl_InstanceID);');
+        .replace('#include <common>', '#include <common>\nattribute float aPlateLayer;\nflat varying float vPlate;')
+        .replace('#include <begin_vertex>', '#include <begin_vertex>\nvPlate = aPlateLayer;');
     }
     // helpers go after map_pars_fragment, where the artwork's map sampler is declared
     shader.fragmentShader = shader.fragmentShader.replace('#include <map_pars_fragment>', /* glsl */ `#include <map_pars_fragment>
@@ -351,25 +468,97 @@ export class MetalCard {
       uniform float uEtchDepth;
       uniform float uEtchBevel;  // groove shoulder width, in artwork texels
       uniform vec2 uMapTexel;
+      uniform float uOwnerFinish; // the owner: 0 ink, 1 mirror, 2 etched
+      uniform vec3 uOwnerInk;     // and the ink's colour
       ${plates ? `
       uniform highp sampler2DArray uPlateArt;
       uniform float uPlateArtCount;  // 0: the plates share the card's artwork
       uniform vec2 uPlateTexel;
       flat varying float vPlate;
+      uniform sampler2D uFocusArt;
+      uniform float uFocusLayer;
+      uniform vec2 uFocusTexel;
+      bool cardFocused() { return uFocusLayer > -0.5 && abs(vPlate - uFocusLayer) < 0.5; }
       vec4 cardArt(vec2 uv) {
-        return uPlateArtCount > 0.5 ? texture(uPlateArt, vec3(uv, mod(vPlate, uPlateArtCount))) : texture2D(map, uv);
+        if (cardFocused()) return texture2D(uFocusArt, uv);
+        return uPlateArtCount > 0.5 ? texture(uPlateArt, vec3(uv, vPlate)) : texture2D(map, uv);
       }
-      vec2 cardTexel() { return uPlateArtCount > 0.5 ? uPlateTexel : uMapTexel; }
+      vec2 cardTexel() { return cardFocused() ? uFocusTexel : uPlateArtCount > 0.5 ? uPlateTexel : uMapTexel; }
+      // a ticket's lettering, apart from its artwork: the page's marks (the
+      // same on every ticket, their own texture), and the owner, cut through
+      // (in the alpha)
+      uniform sampler2D uPlateMarks;
+      float cardOwnerAt(vec2 uv) {
+        return uPlateArtCount > 0.5 ? texture2D(uPlateMarks, uv).a : 0.0;
+      }
+      float cardCutAt(vec2 uv) {
+        if (uPlateArtCount < 0.5) return 0.0;
+        return 1.0 - (cardFocused() ? texture2D(uFocusArt, uv).a : texture(uPlateArt, vec3(uv, vPlate)).a);
+      }
+      // a plate's artwork is already cut out under its lettering (when the plate is made)
+      float cardKeepClear(vec2 uv) { return 0.0; }
+      vec3 cardPlainGround(vec2 uv) { return cardArt(uv).rgb; }
+      // plates are never mid-etch
+      float cardReveal(vec2 uv) { return 1.0; }
+      vec3 cardLaserGlow(vec2 uv, float ink) { return vec3(0.0); }
       ` : `
       vec4 cardArt(vec2 uv) { return texture2D(map, uv); }
       vec2 cardTexel() { return uMapTexel; }
+
+      // the laser: it rasters the face row by row, back and forth, cutting
+      // only the runs of new ink in each row and skipping the gaps
+      uniform float uLaserOn;
+      uniform float uLaserP;        // 0..1 through the pass
+      uniform sampler2D uLaserPlan; // per cell, top row first: when it's cut (-1: never)
+      uniform float uLaserSeconds;
+      uniform vec2 uLaserHead;      // where the head is (uv)
+      uniform float uLaserFiring;   // and whether it's cutting there
+      uniform float uLaserAspect;   // the card's height over its width
+      // when the beam crosses uv, 0..1 through the pass (-1: it never does)
+      float laserTime(vec2 uv) { return texture2D(uLaserPlan, vec2(uv.x, 1.0 - uv.y)).r; }
+      float cardReveal(vec2 uv) { return uLaserOn > 0.5 ? step(laserTime(uv), uLaserP) : 1.0; }
+      // a ticket's lettering, its own layer: shown as far as the laser has cut it
+      uniform sampler2D uFaceLettering; // all of it: the artwork keeps clear of it
+      uniform sampler2D uFaceMarks;     // the page's marks, finished
+      uniform sampler2D uFaceOwner;     // the owner, cut
+      uniform float uFaceLetteringOn;   // 0 none; 1 keeping clear; 2 being cut; 3 cut through
+      float cardOwnerAt(vec2 uv) {
+        return uFaceLetteringOn > 1.5 ? texture2D(uFaceMarks, uv).a * cardReveal(uv) : 0.0;
+      }
+      float cardCutAt(vec2 uv) {
+        return uFaceLetteringOn > 1.5 ? texture2D(uFaceOwner, uv).a * cardReveal(uv) : 0.0;
+      }
+      // no artwork under the lettering: the bare colour field there
+      uniform sampler2D uFacePlainGround;
+      float cardKeepClear(vec2 uv) {
+        return uFaceLetteringOn < 0.5 ? 0.0 : texture2D(uFaceLettering, uv).a;
+      }
+      vec3 cardPlainGround(vec2 uv) { return texture2D(uFacePlainGround, uv).rgb; }
+      // freshly cut metal glows, cooling within a moment; the spot under a firing head is white-hot
+      vec3 cardLaserGlow(vec2 uv, float ink) {
+        if (uLaserOn < 0.5) return vec3(0.0);
+        float t = laserTime(uv);
+        float age = (uLaserP - t) * uLaserSeconds;
+        float trail = t >= 0.0 && age >= 0.0 ? exp(-age * 5.0) : 0.0;
+        vec2 d = (uv - uLaserHead) * vec2(1.0, uLaserAspect);
+        float r2 = dot(d, d);
+        return vec3(1.0, 0.38, 0.1) * ink * trail * 3.0
+          + uLaserFiring * (vec3(1.0, 0.82, 0.6) * exp(-r2 / 0.00001) * 6.0
+            + vec3(1.0, 0.45, 0.15) * exp(-r2 / 0.0003) * 0.7);
+      }
       `}
 
-      // how much of the artwork's dark linework is under uv
+      // how much of the artwork's dark linework is under uv (none yet where the
+      // laser hasn't been) — and the owner too, when it's etched like the artwork
       float cardInkAt(vec2 uv) {
         float lum = dot(cardArt(uv).rgb, vec3(0.299, 0.587, 0.114));
-        return 1.0 - smoothstep(0.12, 0.4, lum);
+        float ink = (1.0 - smoothstep(0.12, 0.4, lum)) * cardReveal(uv) * (1.0 - cardKeepClear(uv));
+        return uOwnerFinish > 1.5 ? max(ink, cardOwnerAt(uv)) : ink;
       }
+
+      // the face where the laser hasn't been yet: the bare ground
+      uniform sampler2D uLaserGround;
+      vec3 cardGround(vec2 uv) { return texture2D(uLaserGround, uv).rgb; }
 
       // tilt the normal by a height gradient measured across the artwork
       // (per uv), not across screen pixels — smooth, so fine lines don't
@@ -385,8 +574,19 @@ export class MetalCard {
         return normalize(surfNorm - (dHduv.x * T + dHduv.y * B) * scale);
       }
     `)
-      .replace('#include <map_fragment>', /* glsl */ `diffuseColor *= cardArt(vMapUv);
+      .replace('#include <map_fragment>', /* glsl */ `// the owner's letters are die-cut out of the card
+        if (cardCutAt(vMapUv) > 0.5) discard;
+        vec4 cardColor = cardArt(vMapUv);
+        // not yet cut: the plain ground, no linework
+        if (cardReveal(vMapUv) < 0.5) cardColor.rgb = cardGround(vMapUv);
+        // under the lettering: the ground, without the linework
+        cardColor.rgb = mix(cardColor.rgb, cardPlainGround(vMapUv), cardKeepClear(vMapUv));
+        diffuseColor *= cardColor;
         float cardSticker = 0.0;
+        // the owner as its own material: ink or mirror (etched, it's part of the linework)
+        float cardOwner = uOwnerFinish < 1.5 ? cardOwnerAt(vMapUv) : 0.0;
+        float cardOwnerMirror = uOwnerFinish > 0.5 ? cardOwner : 0.0;
+        float cardOwnerInk = cardOwner - cardOwnerMirror;
         float cardInk = 0.0;    // the artwork's linework
         float cardEtchH = 0.0;  // groove depth, 0..1
         vec2 cardEtchGrad = vec2(0.0);  // its slope across the artwork
@@ -409,6 +609,9 @@ export class MetalCard {
             float shade = 1.0 - 0.55 * cardEtchH * clamp(uEtchDepth * 1.5, 0.0, 1.0);
             diffuseColor.rgb = mix(diffuseColor.rgb, vec3(0.55, 0.56, 0.6) * shade, cardInk);
           }
+          // the owner over the artwork: matte black ink, or a bright mirror polish
+          diffuseColor.rgb = mix(diffuseColor.rgb, uOwnerInk, cardOwnerInk);
+          diffuseColor.rgb = mix(diffuseColor.rgb, vec3(0.98), cardOwnerMirror);
           // stickers sit on top of everything
           vec4 stk = texture2D(uStickerMap, vMapUv);
           cardSticker = stk.a;
@@ -418,9 +621,14 @@ export class MetalCard {
       .replace('#include <roughnessmap_fragment>', `#include <roughnessmap_fragment>
         roughnessFactor = cardBare
           ? mix(mix(roughnessFactor, 0.5, cardInk), 0.55, cardSticker * 0.5)
-          : mix(roughnessFactor, 0.55, max(cardInk, cardSticker * 0.5));`)
+          : mix(roughnessFactor, 0.55, max(cardInk, cardSticker * 0.5));
+        roughnessFactor = mix(roughnessFactor, 0.6, cardOwnerInk);
+        // polished, but not so sharp the highlight shrinks to a point: it sweeps the letters as the card turns
+        roughnessFactor = mix(roughnessFactor, 0.14, cardOwnerMirror);`)
       .replace('#include <metalnessmap_fragment>', `#include <metalnessmap_fragment>
-        metalnessFactor = mix(metalnessFactor, 0.0, cardBare ? cardSticker : max(cardInk, cardSticker));`)
+        metalnessFactor = mix(metalnessFactor, 0.0, cardBare ? cardSticker : max(cardInk, cardSticker));
+        metalnessFactor = mix(metalnessFactor, 0.0, cardOwnerInk);
+        metalnessFactor = mix(metalnessFactor, 1.0, cardOwnerMirror);`)
       // the groove: its shoulders bend the light, so the cut catches it as the card turns
       .replace('#include <normal_fragment_maps>', `#include <normal_fragment_maps>
         if (cardEtched && uEtchDepth > 0.0) {
@@ -428,9 +636,18 @@ export class MetalCard {
           vec2 dHduv = -cardEtchGrad * uEtchDepth * 0.08 * (1.0 - cardSticker);
           normal = cardEtchPerturb(-vViewPosition, normal, vMapUv, dHduv / cardTexel());
         }`)
+      .replace('#include <emissivemap_fragment>', `#include <emissivemap_fragment>
+        totalEmissiveRadiance += cardLaserGlow(vMapUv, cardInk);
+        // polished letters never go dull: a faint lift under the shine
+        totalEmissiveRadiance += vec3(0.1) * cardOwnerMirror;`)
       .replace('#include <lights_physical_fragment>', `#include <lights_physical_fragment>
         #ifdef USE_IRIDESCENCE
-          material.iridescence *= 1.0 - max(cardInk, cardSticker);
+          material.iridescence *= 1.0 - max(max(cardInk, cardSticker), cardOwner);
+        #endif
+        #ifdef USE_CLEARCOAT
+          // a full, glassy clearcoat over polished letters: a second, sharper glint
+          material.clearcoat = mix(material.clearcoat, 1.0, cardOwnerMirror);
+          material.clearcoatRoughness = mix(material.clearcoatRoughness, 0.02, cardOwnerMirror);
         #endif`);
   }
 
@@ -441,6 +658,49 @@ export class MetalCard {
     this.stickerMap.value = stickers;
     const img = surface.image as { width?: number; height?: number } | undefined;
     if (img?.width && img.height) this.etch.uMapTexel.value.set(1 / img.width, 1 / img.height);
+  }
+
+  /** The page's marks on every ticket plate, finished like the owner setting says (the caller owns the texture). */
+  setPlateMarks(marks: THREE.Texture | null) {
+    this.plateArt.uPlateMarks.value = marks;
+  }
+
+  /** Tiles: turn and scroll the wall by (dx, dy) in the stack's units; hold it while dragging, or let it glide on at (vx, vy). */
+  scrollTiles(dx: number, dy: number) {
+    this.stack.scrollBy(dx, dy);
+  }
+
+  /** Tiles: how far the wall's been scrolled */
+  get tilesScrollY() {
+    return this.stack.scrollY;
+  }
+
+  holdTiles(held: boolean, vx = 0, vy = 0) {
+    this.stack.holdScroll(held, vx, vy);
+  }
+
+  /** The pulled-out plate's artwork at full size, standing in for pool layer `layer` (null, -1: none). The caller owns the texture. */
+  setFocusArt(art: THREE.Texture | null, layer: number) {
+    this.plateArt.uFocusArt.value = art;
+    this.plateArt.uFocusLayer.value = art ? layer : -1;
+    const img = art?.image as { width: number; height: number } | undefined;
+    if (img) this.plateArt.uFocusTexel.value.set(1 / img.width, 1 / img.height);
+  }
+
+  /** Which layer of the plate art plate i shows (its ticket's slot in the pool). */
+  setPlateLayer(i: number, layer: number) {
+    if (this.plateLayer.getX(i) === layer) return;
+    this.plateLayer.setX(i, layer);
+    this.plateLayer.needsUpdate = true;
+  }
+
+  /** Plates made of tickets: each hidden until its artwork is in (see StackAnimator.gate). */
+  gatePlates(on: boolean) {
+    this.stack.gate(on);
+  }
+
+  plateReady(i: number, ready = true) {
+    this.stack.setReady(i, ready);
   }
 
   /**
@@ -459,6 +719,11 @@ export class MetalCard {
    * frosted plate) or filled with matte black. Depth 0..1; bevel is the
    * groove's shoulder width in artwork texels.
    */
+  /** How a ticket's username and number are finished: polished Mirror, printed Ink, or Etched like the artwork. */
+  setOwnerFinish(finish: string) {
+    this.etch.uOwnerFinish.value = finish === 'Ink' ? 0 : finish === 'Etched' ? 2 : 1;
+  }
+
   setEtch(ink: string, depth: number, bevel: number) {
     this.etch.uEtchMode.value = ink === 'Etched' ? 1 : ink === 'Etched + filled' ? 2 : 0;
     this.etch.uEtchDepth.value = depth;
@@ -514,6 +779,76 @@ export class MetalCard {
     this.rot.x += dy * SPIN_PER_PX;
     this.vel.y = THREE.MathUtils.clamp((dx * SPIN_PER_PX) / dt, -MAX_SPIN, MAX_SPIN);
     this.vel.x = THREE.MathUtils.clamp((dy * SPIN_PER_PX) / dt, -MAX_SPIN, MAX_SPIN);
+  }
+
+  private buildLaser() {
+    const hot = { color: '#ffb27a', transparent: true, blending: THREE.AdditiveBlending, depthWrite: false };
+    // the beam: thin and bright, fading up out of the spot
+    const beamGeo = new THREE.CylinderGeometry(0.0035, 0.0035, 1.4, 8, 1, true);
+    beamGeo.rotateX(Math.PI / 2);
+    beamGeo.translate(0, 0, 0.7);
+    const beam = new THREE.Mesh(beamGeo, new THREE.MeshBasicMaterial({ ...hot, opacity: 0.55 }));
+    const spot = new THREE.Sprite(new THREE.SpriteMaterial({ ...hot, color: '#ffffff', map: glowTexture() }));
+    spot.scale.setScalar(0.09);
+    spot.name = 'spot';
+    this.laser.add(beam, spot, this.laserLight);
+    this.laserLight.position.z = 0.04;
+    this.laser.visible = false;
+  }
+
+  /**
+   * A ticket's lettering on the face, like the stack's: the artwork keeps
+   * clear of all of it; at stage 1 the laser is cutting it (the marks
+   * finished, the owner cut out of the face), at 2 it's cut through the card.
+   * Null: none. The caller owns the textures.
+   */
+  setFaceLettering(all: THREE.Texture | null, marks: THREE.Texture | null, owner: THREE.Texture | null, stage: number) {
+    const u = this.laserU;
+    u.uFaceLettering.value = all;
+    u.uFaceMarks.value = marks;
+    u.uFaceOwner.value = owner;
+    u.uFaceLetteringOn.value = all ? 1 + stage : 0;
+  }
+
+  /** The ticket's bare colour field, under its lettering where the artwork isn't (the caller owns the texture). */
+  setFacePlainGround(ground: THREE.Texture | null) {
+    this.laserU.uFacePlainGround.value = ground;
+  }
+
+  /** What the face looks like before the laser cuts it (the caller owns the texture). */
+  setLaserGround(ground: THREE.Texture | null) {
+    this.laserU.uLaserGround.value = ground;
+  }
+
+  /** The pass the laser is about to run (see laser.ts): its route, row by row, and its length. */
+  setLaserPlan(times: Float32Array, cols: number, rows: number, seconds: number) {
+    this.laserU.uLaserPlan.value?.dispose();
+    const plan = new THREE.DataTexture(times, cols, rows, THREE.RedFormat, THREE.FloatType);
+    plan.minFilter = plan.magFilter = THREE.NearestFilter;
+    plan.needsUpdate = true;
+    this.laserU.uLaserPlan.value = plan;
+    this.laserU.uLaserSeconds.value = seconds;
+  }
+
+  /**
+   * Etch the face: p 0..1 through the pass, the head at uv (u, v), firing or
+   * just moving; null when the laser's done (or not running).
+   */
+  setLaser(p: number | null, head?: { u: number; v: number; firing: boolean }, time = 0) {
+    const on = p !== null && !!head && this.laserU.uLaserGround.value !== null && this.laserU.uLaserPlan.value !== null;
+    this.laserU.uLaserOn.value = on ? 1 : 0;
+    this.laser.visible = on && head.firing;
+    this.laserLight.intensity = 0;
+    if (!on) return;
+    this.laserU.uLaserP.value = p;
+    this.laserU.uLaserAspect.value = this.size.h / this.size.w;
+    this.laserU.uLaserHead.value.set(head.u, head.v);
+    this.laserU.uLaserFiring.value = head.firing ? 1 : 0;
+    this.laser.position.set((head.u - 0.5) * this.size.w, (head.v - 0.5) * this.size.h, THICKNESS / 2 + FACE_LIFT + 0.0005);
+    // it flickers as it cuts
+    const flicker = 0.75 + 0.25 * Math.sin(time * 97) * Math.sin(time * 61);
+    this.laserLight.intensity = 0.9 * flicker;
+    (this.laser.getObjectByName('spot') as THREE.Sprite).scale.setScalar(0.07 + 0.025 * flicker);
   }
 
   update(dt: number, time: number) {

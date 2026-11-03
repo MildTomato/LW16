@@ -129,6 +129,21 @@ export async function engineLinework(
   /** how many layers Random draws */
   count = 3,
 ): Promise<string> {
+  const { stages } = await engineStages(system, seed, box, count);
+  return stages[stages.length - 1];
+}
+
+/**
+ * The same linework built up a layer at a time: stage k is the first k + 1
+ * layers, the last is the whole — so it can be cut in layer by layer. (The
+ * engine keeps each layer's drawing, so the stages cost little more than one.)
+ */
+export async function engineStages(
+  system: string,
+  seed: number,
+  box: { x: number; y: number; w: number; h: number },
+  count = 3,
+): Promise<{ stages: string[]; layers: unknown[] }> {
   const load = Object.values(ENGINE)[0];
   if (!load) throw new Error('the Visual Engine submodule is not checked out');
   const engine = (await load()) as EngineModule;
@@ -141,15 +156,16 @@ export async function engineLinework(
     layers = [layer];
   }
   const cw = Math.round(box.w * DRAW_SCALE), ch = Math.round(box.h * DRAW_SCALE);
-  const svg = engine.compositionSvg({
-    version: 1,
-    name: 'Card',
-    canvas: { w: cw, h: ch, ratio: 'custom', bg: '#000000', transparent: true, resizeMode: 'recompose' },
-    layers,
-    active: null,
-  }, { transparent: true, frame: false, tick: 0 });
-  const inner = svg.slice(svg.indexOf('>') + 1, svg.lastIndexOf('</svg>'));
-  return `<defs>
+  const stages = layers.map((_, k) => {
+    const svg = engine.compositionSvg({
+      version: 1,
+      name: 'Card',
+      canvas: { w: cw, h: ch, ratio: 'custom', bg: '#000000', transparent: true, resizeMode: 'recompose' },
+      layers: layers.slice(0, k + 1),
+      active: null,
+    }, { transparent: true, frame: false, tick: 0 });
+    const inner = svg.slice(svg.indexOf('>') + 1, svg.lastIndexOf('</svg>'));
+    return `<defs>
     <filter id="engine-ink" color-interpolation-filters="sRGB">
       <feColorMatrix type="matrix" values="0 0 0 0 0.102  0 0 0 0 0.102  0 0 0 0 0.102  0.42 0.82 0.16 0 0"/>
     </filter>
@@ -157,4 +173,7 @@ export async function engineLinework(
   <g filter="url(#engine-ink)" fill="#000" stroke="none" stroke-width="1">
     <svg x="${box.x}" y="${box.y}" width="${box.w}" height="${box.h}" viewBox="0 0 ${cw} ${ch}">${inner}</svg>
   </g>`;
+  });
+  // the layers themselves, as plain data: what a ticket keeps of its artwork
+  return { stages, layers: JSON.parse(JSON.stringify(layers)) as unknown[] };
 }

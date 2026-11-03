@@ -1,12 +1,15 @@
 import { useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { useDialKitController, DialRoot, DialStore, type DialConfig } from 'dialkit';
-import { HoloApp, type HoloParams, type ImagesState } from './scene.ts';
+import { HoloApp, type HoloParams, type ImagesState, type LaserStatus } from './scene.ts';
 import { STICKER_SHEET } from './stickers.ts';
 import { MAX_PLATES, STACK_OPTIONS } from './cardStack.ts';
 import { ENGINE_AVAILABLE, ENGINE_RANDOM, ENGINE_SYSTEMS } from './engineArt.ts';
 import { irrelevantControls, useHiddenControls } from './panelVisibility.ts';
 import { LIGHTING } from './lighting.ts';
+import { TicketMaker } from './TicketMaker.tsx';
+import { ViewSwitch } from './ViewSwitch.tsx';
+import { onTicket, supabase, ticketCount, ticketImageUrl, ticketRange, type Ticket } from './tickets.ts';
 import { withUrlDefaults, panelDefaults, flattenValues, writeUrl } from './urlState.ts';
 
 const PERFORMANCE_KEY = 'holocloth.performance';
@@ -139,8 +142,8 @@ const PRESET_VALUES: Record<string, PresetBundle> = {
       sheen: 0.7,
       bump: 0.15,
       bumpTiling: 3,
+      // Matte's own thin coat: the die-cut lettering reads crisper without a gloss over it
       ...FINISH_VALUES.Matte,
-      clearcoat: 0.53,
     },
     render: { ...RENDER_DEFAULTS },
   },
@@ -447,6 +450,12 @@ const BASE_PANEL = {
     },
     etchDepth: [0.04, 0, 1, 0.01],
     etchBevel: [0.5, 0.5, 8, 0.1],
+    /** a ticket's page marks (Petabyte, Prototype, the margin rule): polished to a shine, printed in ink, or etched like the artwork. Its username and number are cut through the card. */
+    owner: {
+      type: 'select' as const,
+      options: ['Mirror', 'Ink', 'Etched'],
+      default: 'Mirror',
+    },
     corner: [0.04, 0, 0.3, 0.005],
     /** the back of the card (and every plate): a mirror polish, or brushed metal */
     back: {
@@ -479,7 +488,7 @@ const BASE_PANEL = {
     iridescence: [0.81, 0, 1, 0.01],
     roughness: [0.62, 0, 1, 0.01],
     metalness: [0.93, 0, 1, 0.01],
-    clearcoat: [0.53, 0, 1, 0.01],
+    clearcoat: [0.06, 0, 1, 0.01],
     coatRoughness: [0.7, 0, 1, 0.01],
     sheen: [0.7, 0, 1, 0.01],
     bump: [0.15, 0, 3, 0.01],
@@ -705,6 +714,8 @@ export default function App() {
     window.addEventListener('pointercancel', finish);
   };
   const [loadPercent, setLoadPercent] = useState(0);
+  /** the laser cutting a ticket, for the ticket console's readout */
+  const [laser, setLaser] = useState<LaserStatus | null>(null);
   const [assetsReady, setAssetsReady] = useState(false);
   const [loaderGone, setLoaderGone] = useState(false);
 
@@ -719,6 +730,24 @@ export default function App() {
     app.onStickerPick = (item, e) => carrySticker(item.img, e, item.rotation, true);
     app.onFaceStatus = setFaceStatus;
     app.onHandStatus = setHandStatus;
+    app.onLaser = setLaser;
+    // the stack is made of everyone's tickets; new and remixed ones arrive live
+    const asPlate = (t: Ticket) => ({ id: t.id, url: ticketImageUrl(t), owner: t.username, number: t.number });
+    if (supabase) app.awaitTickets();
+    const stopTickets = onTicket((t) => app.upsertTicket(asPlate(t)));
+    // how many tickets there are; the scene fetches the ones it's about to
+    // show. If even the count can't be had, try again, waiting longer each time
+    let ticketsTimer = 0;
+    const fetchTickets = (attempt = 0) =>
+      ticketCount()
+        .then((total) => {
+          if (appRef.current === app) app.setTickets(total, (from, to) => ticketRange(from, to).then((list) => list.map(asPlate)));
+        })
+        .catch((err) => {
+          console.error('[holocloth]', err);
+          if (appRef.current === app) ticketsTimer = window.setTimeout(() => fetchTickets(attempt + 1), Math.min(30000, 2000 * 2 ** attempt));
+        });
+    fetchTickets();
     // startup assets: cloth poster + bump map, with combined download
     // progress driving the loader; the cloth stays hidden until both land
     const assets = [
@@ -790,6 +819,8 @@ export default function App() {
 
     return () => {
       unsubVersions();
+      stopTickets();
+      window.clearTimeout(ticketsTimer);
       app.dispose();
       appRef.current = null;
     };
@@ -1047,6 +1078,25 @@ export default function App() {
       )}
       {!CLEAN && SIDEBAR !== 'off' && (
         <DialRoot position="top-right" defaultOpen={SIDEBAR !== 'closed'} productionEnabled />
+      )}
+      {!CLEAN && params.cards === 'Stack' && (
+        <ViewSwitch
+          view={params.stack.shape === 'Tiles' ? 'Tiles' : 'Helix'}
+          dark={params.theme === 'Dark'}
+          onView={(shape) => dial.setValues({ stack: { shape } } as never)}
+        />
+      )}
+      {!CLEAN && (
+        <TicketMaker
+          laser={laser}
+          dark={params.theme === 'Dark'}
+          onOpen={(open) => (open ? appRef.current?.beginTicket() : appRef.current?.endTicket())}
+          onArt={(drawn, etch) => (etch ? appRef.current?.etchTicket(drawn) : appRef.current?.retitleTicket(drawn))}
+          onSaved={(t) => {
+            appRef.current?.upsertTicket({ id: t.id, url: ticketImageUrl(t), owner: t.username, number: t.number });
+            appRef.current?.showTicket(t.id);
+          }}
+        />
       )}
       {!loaderGone && <Loader percent={loadPercent} hiding={assetsReady} />}
     </>

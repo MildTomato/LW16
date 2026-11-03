@@ -31,7 +31,7 @@ const UNIT = 229;
 const FRAME_W = 4 * UNIT;
 const STROKE = '#1a1a1a';
 const STROKE_W = 2;
-/** the margin rule between the labels (see MARGIN_MARKS) */
+/** the margin rule between the labels (see marginMarks) */
 const RULE_X = 100;
 const RULE_BOTTOM = 2826;
 /** Growth's outer square: full width, 7 x 256 so every halving stays on whole pixels */
@@ -117,12 +117,33 @@ export function gridLinework(o: GridOptions): string {
   return out.join('\n    ');
 }
 
+const MARK_FONT = 'Helvetica Neue, Helvetica, Arial, sans-serif';
+
+/** a ticket's owner: their username, and the ticket's number once it has one */
+export interface TicketOwner {
+  username: string;
+  number?: number;
+}
+
+/**
+ * The owner's font, Geist Pixel Line — striped, so it cuts as a run of
+ * slots. An SVG drawn as an image can't reach the page's fonts, so it travels
+ * inside the SVG, as data: load it before drawing an owner.
+ */
+let ownerFont = '';
+let ownerFontLoad: Promise<void> | null = null;
+export const loadOwnerFont = () =>
+  (ownerFontLoad ??= fetchDataUrl('/fonts/GeistPixel-Line.woff2').then((url) => {
+    ownerFont = url;
+  }));
+
 /** Corner labels and the margin rule between them — identical in construction.svg. */
-const MARGIN_MARKS = `<g fill="#1a1a1a" stroke="none" font-family="Helvetica Neue, Helvetica, Arial, sans-serif" font-size="44" font-weight="300" letter-spacing="0.5">
+const marginMarks = () => `<g fill="#1a1a1a" stroke="none" font-family="${MARK_FONT}" font-size="44" font-weight="300" letter-spacing="0.5">
     <text x="100" y="132">Petabyte</text>
     <text x="100" y="2900">Prototype</text>
   </g>
   <line x1="100" y1="176" x2="100" y2="2826" stroke="#1a1a1a" stroke-width="2"/>`;
+const escapeXml = (t: string) => t.replace(/[<>&"']/g, (c) => `&#${c.charCodeAt(0)};`);
 
 /** Full page: the colour field (as a data URL) under the generated linework. */
 export function gridSvg(o: GridOptions, fieldDataUrl: string): string {
@@ -427,12 +448,64 @@ export function ditherSvg(lum: Float32Array, cols: number, rows: number, fieldDa
   return pageSvg(ditherLinework(lum, cols, rows, style, size), fieldDataUrl);
 }
 
-/** Any linework on the page: the field, the margin's marks, and the linework in ink. */
-export function pageWith(linework: string, fieldDataUrl: string): string {
-  return pageSvg(linework, fieldDataUrl);
+/** The page around some linework: the colour field, the linework in ink, and (unless left off) the margin's marks. */
+export function pageWith(linework: string, fieldDataUrl: string, marks = true): string {
+  return pageSvg(linework, fieldDataUrl, marks);
 }
 
-function pageSvg(linework: string, fieldDataUrl: string): string {
+/*
+ * A ticket is four layers, each its own whole-page image, laid one over
+ * another only when it's shown:
+ *   the ground — the colour field, the same on every ticket;
+ *   the ink — the ticket's own linework on clear ground (all that's stored);
+ *   the marks — "Petabyte", "Prototype" and the margin rule;
+ *   the owner — the username and ticket number, from the ticket's row.
+ */
+const page = (body: string) =>
+  `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}">${body}</svg>`;
+
+export function groundPage(fieldDataUrl: string): string {
+  return pageSvg('', fieldDataUrl, false);
+}
+
+export function inkPage(linework: string): string {
+  return page(`<g fill="none" stroke="${STROKE}" stroke-width="${STROKE_W}" stroke-linecap="round">
+    ${linework}
+  </g>`);
+}
+
+export function marksPage(): string {
+  return page(marginMarks());
+}
+
+/**
+ * The owner up the right edge, from the bottom corner: the username large,
+ * and on the next line (nearer the edge) the ticket's number, the same size —
+ * as large as both fit along the edge. Load the owner font first.
+ */
+export function ownerPage(o: TicketOwner): string {
+  const name = `@${o.username}`;
+  const number = o.number ? `#${String(o.number).padStart(4, '0')}` : '';
+  // Geist Pixel's advance is about 0.62 of its size
+  const reach = RULE_BOTTOM - 176 - 40;
+  const size = Math.min(420, Math.floor(reach / (0.62 * Math.max(name.length, number.length))));
+  const line = Math.round(size * 1.05);
+  // turned a quarter, a line's "below" is toward the edge: the number sits there, the name a line in
+  const at = (x: number, text: string) =>
+    `<text transform="translate(${x} ${RULE_BOTTOM}) rotate(-90)">${escapeXml(text)}</text>`;
+  return page(`<defs><style>@font-face { font-family: 'Geist Pixel Line'; src: url(${ownerFont}) format('woff2'); }</style></defs>
+  <g fill="#1a1a1a" font-family="'Geist Pixel Line', monospace" font-size="${size}">
+    ${at(number ? W - RULE_X - line : W - RULE_X, name)}${number ? `
+    ${at(W - RULE_X, number)}` : ''}
+  </g>`);
+}
+
+/** Layers (each a whole-page image's URL) laid one over another, as one image of the page. */
+export function stackPages(urls: string[]): string {
+  return page(urls.map((u) => `<image href="${u}" x="0" y="0" width="${W}" height="${H}"/>`).join(''));
+}
+
+function pageSvg(linework: string, fieldDataUrl: string, marks = true): string {
   return `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}">
   <defs>
     <filter id="soft" x="-200" y="-200" width="${W + 400}" height="${H + 400}" filterUnits="userSpaceOnUse">
@@ -444,7 +517,7 @@ function pageSvg(linework: string, fieldDataUrl: string): string {
   <g fill="none" stroke="${STROKE}" stroke-width="${STROKE_W}" stroke-linecap="round">
     ${linework}
   </g>
-  ${MARGIN_MARKS}
+  ${marks ? marginMarks() : ''}
 </svg>`;
 }
 

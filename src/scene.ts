@@ -13,11 +13,11 @@ import { normalMapFromImage } from './textures.ts';
 import { MacroDofPass } from './dofPass.ts';
 import { BAKED_POSE } from './bakedPose.ts';
 import { engineLinework } from './engineArt.ts';
-import { plateArtKey, loadPlateArt, savePlateArt } from './plateArtCache.ts';
-import { gridSvg, growthSvg, barsSvg, asciiSvg, asciiGrid, ditherSvg, ditherGrid, pageWith, ASCII, sampleLuminance, loadImage, fetchDataUrl } from './gridArt.ts';
+import { LASER_COLS, LASER_ROWS, headAt, planPass, type LaserPlan } from './laser.ts';
+import { gridSvg, growthSvg, barsSvg, asciiSvg, asciiGrid, ditherSvg, ditherGrid, pageWith, groundPage, marksPage, ownerPage, loadOwnerFont, ASCII, sampleLuminance, loadImage, fetchDataUrl } from './gridArt.ts';
 import { FaceTracker } from './faceTracker.ts';
 import { MetalCard } from './card.ts';
-import type { StackParams } from './cardStack.ts';
+import { TILE_COUNT, TILE_RADIUS, tileTicket, type StackParams } from './cardStack.ts';
 import {
   nextShot, shotCamera, shotLight, shotPose, nextClothShot, moveProgress, shotProgress, type Shot, type ClothShot,
 } from './cinematic.ts';
@@ -50,6 +50,8 @@ export interface HoloParams {
     corner: number;
     /** the back: Mirror or Brushed */
     back?: string;
+    /** a ticket's username and number: Mirror, Ink or Etched */
+    owner?: string;
     /** roughly how long each cinematic shot holds (s), and how dramatic its light is */
     shotLength: number;
     drama: number;
@@ -148,8 +150,30 @@ export interface HoloParams {
   };
 }
 
-/** how far right the baked view aimed to leave room for the panel */
-const BAKED_PANEL_SHIFT = 0.525;
+/** how far the Tiles wall fades out behind a pulled-out tile */
+const TILE_VEIL = 0.7;
+/** how far ahead of the camera the veil hangs: nearer than any of the wall in view */
+const TILE_VEIL_DIST = 3;
+/** seconds the veil takes to fade in, or out */
+const VEIL_TIME = 0.4;
+/** Tiles is lit up: its wall faces inward, away from most of the room's light */
+const TILES_LIGHT = 1.45;
+/** and how far (radians) its light is tipped up toward the top of the wall */
+const TILES_LIGHT_TIP = 0.55;
+/** Tiles is seen from inside its drum, looking at the wall ahead */
+const TILES_VIEW = {
+  // back from the middle toward the far wall, for more of it in view
+  camera: [0, 0, 1.6] as [number, number, number],
+  target: [0, 0, -2] as [number, number, number],
+  fov: 56,
+};
+/** the lens everywhere else */
+const LENS_FOV = 38;
+/** the view a page opens on, unless its link carries one */
+const DEFAULT_VIEW = {
+  camera: [4.315, 0.867, -2.903] as [number, number, number],
+  target: [0, -0.046, -0.034] as [number, number, number],
+};
 const TONE_MAPPINGS: Record<string, THREE.ToneMapping> = {
   AgX: THREE.AgXToneMapping,
   ACES: THREE.ACESFilmicToneMapping,
@@ -157,11 +181,62 @@ const TONE_MAPPINGS: Record<string, THREE.ToneMapping> = {
 };
 
 /** the Flower artwork's photos: each a single stem on solid black */
+/** room for this many tickets in the stack, each at this size (a 2:3 page) */
 /**
- * The stack's own artworks: how many (cycled through the plates) and their
- * size — the page at about half its size, plenty for a plate in a formation.
+ * Each card's artwork drawn at about the size it's shown: the Tiles wall's
+ * cards are small, the Helix's bigger — and a pulled-out card, filling the
+ * view, gets its own at full size (FOCUS_ART)
  */
-const PLATE_ART = { count: 8, w: 1000, h: 1500 };
+const POOLS = {
+  Helix: { count: 40, w: 640, h: 960 },
+  Tiles: { count: 64, w: 320, h: 480 },
+};
+const FOCUS_ART = { w: 1000, h: 1500 };
+/** how far round the view (stack units) a wall card still counts as on screen: about a card */
+const TILE_VIEW_MARGIN = 1.6;
+const viewFrustum = new THREE.Frustum();
+const viewMatrix = new THREE.Matrix4();
+const viewSphere = new THREE.Sphere();
+type PoolKind = keyof typeof POOLS;
+/** how long before a ticket image that failed to load is tried again */
+const TICKET_RETRY_MS = 5000;
+/** tickets are fetched this many at a time (two rows of the Tiles wall), as they come into view */
+const TICKET_PAGE = 48;
+/** the Helix shows the latest of the tickets, at most this many */
+const HELIX_TICKETS = 40;
+/** a ticket for the stack: its image (its linework alone) and its owner's username */
+type TicketSource = { id: string; url: string; owner: string; number: number };
+/** a slot of the plate art: which ticket's image it holds, whether that's in, and when it was last on a plate */
+type TicketSlot = { id: string | null; ready: boolean; used: number };
+/** a drawn ticket, as the laser cuts it: its stages, and its lettering (all of it, its marks, its owner, and over the artwork) */
+type TicketCut = {
+  stages: HTMLImageElement[];
+  lettering: HTMLImageElement;
+  marks: HTMLImageElement;
+  owner: HTMLImageElement | null;
+  lettered: HTMLImageElement;
+};
+/**
+ * The laser cutting a ticket: which pass of how many (the last is the
+ * lettering), how far through it, where the head is (the card's uv), and
+ * whether it's firing.
+ */
+export interface LaserStatus {
+  pass: number;
+  passes: number;
+  progress: number;
+  u: number;
+  v: number;
+  firing: boolean;
+}
+const newCanvas = (w: number, h: number) => {
+  const c = document.createElement('canvas');
+  c.width = w;
+  c.height = h;
+  return c.getContext('2d', { willReadFrequently: true })!;
+};
+const svgImage = (svg: string) => loadImage(`data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`);
+
 
 /** how far a pulled-out plate leans toward a cursor at the edge of the view (radians), and how fast it follows */
 const PLATE_LEAN = THREE.MathUtils.degToRad(10);
@@ -359,6 +434,9 @@ export class HoloApp {
   onDecalSelect: ((scale: number, rotation: number) => void) | null = null;
   /** App-level hook: any uploaded image (cloth/decal/bump) changed. */
   onImagesChanged: (() => void) | null = null;
+  /** the laser's state while it cuts a ticket (a few times a second), and null when it's done */
+  onLaser: ((s: LaserStatus | null) => void) | null = null;
+  private laserReported = 0;
   /** App-level hook: a sticker was peeled off the cloth; the app carries it from here. */
   onStickerPick: ((item: DecalItem, e: PointerEvent) => void) | null = null;
   /** App-level hook: face tracking state, for the on-screen notice */
@@ -380,10 +458,77 @@ export class HoloApp {
   private gridJob = 0;
   private gridTimer: number | null = null;
   private gridField: Promise<string> | null = null;
-  /** the stack's per-plate Engine artworks: what they were drawn from, the job drawing them, and the texture */
-  private plateArtKey = '';
-  private plateArtJob = 0;
-  private plateArt: THREE.DataArrayTexture | null = null;
+  /** the tickets the stack is made of, oldest first: plate i is ticket i */
+  /**
+   * The tickets, in number order — only those fetched so far, by their place
+   * in that order: how many there are, and a page of them is fetched as its
+   * rows come into view
+   */
+  private ticketTotal = 0;
+  private ticketAt = new Map<number, TicketSource>();
+  private ticketIndex = new Map<string, number>();
+  private fetchTicketRange: ((from: number, to: number) => Promise<TicketSource[]>) | null = null;
+  private pagesAsked = new Set<number>();
+  /**
+   * The plate art is a pool of slots, each holding one ticket's image:
+   * plates show whichever tickets are in view, each from its slot, and a
+   * slot long out of view is reused — so any number of tickets can scroll by.
+   */
+  private slots: TicketSlot[] = [];
+  /** which pool the plate art is now */
+  private pool: PoolKind | null = null;
+  private slotOf = new Map<string, number>();
+  /** which ticket each plate shows */
+  private plateTickets: (string | null)[] = [];
+  private slotFrame = 0;
+  /** tickets whose image just failed to load, and when */
+  private ticketFailed = new Map<string, number>();
+  /** a ticket to pull out once its plate is in */
+  private pendingShow: string | null = null;
+  private ticketArt: THREE.DataArrayTexture | null = null;
+  private ticketCtx: CanvasRenderingContext2D | null = null;
+  private ticketGroundImg: Promise<HTMLImageElement> | null = null;
+  /** the pulled-out card's full-size artwork, and the job drawing it */
+  private focusArt: THREE.DataTexture | null = null;
+  private focusJob = 0;
+  /** scratch canvases for laying a ticket's layers together, at the size last used */
+  private composeSize = '';
+  private composeCtx: CanvasRenderingContext2D[] | null = null;
+  private ownerCtx: CanvasRenderingContext2D | null = null;
+  private marksCtx: CanvasRenderingContext2D | null = null;
+  /** the page's marks on the stack's plates (the same on every ticket) */
+  private plateMarks: THREE.Texture | null = null;
+  private inkCtx: CanvasRenderingContext2D | null = null;
+  private ticketMarksImg: Promise<HTMLImageElement> | null = null;
+  /** a ticket is being made on the card; the laser's progress through cutting it (null: not cutting) */
+  private ticketing = false;
+  /** the stack is the Tiles sheet: dragged and scrolled, not orbited */
+  private tilesView = false;
+  /**
+   * Tiles: a veil in the background's colour, just in front of the wall,
+   * so the wall fades out while a tile is looked at
+   */
+  private veil = new THREE.Mesh(
+    new THREE.PlaneGeometry(1, 1),
+    new THREE.MeshBasicMaterial({ transparent: true, opacity: 0, depthWrite: false, fog: false, toneMapped: false }),
+  );
+  private veilK = 0;
+  /** how much brighter the view is lit (Tiles is turned up), eased */
+  private viewLight = 1;
+  private tileDrag: { id: number; x: number; y: number; t: number; vx: number; vy: number } | null = null;
+  /** the camera easing to a view: from, to, and how far (0..1) */
+  private camMove: { from: [THREE.Vector3, THREE.Vector3, number]; to: [THREE.Vector3, THREE.Vector3, number]; k: number } | null = null;
+  private etch: number | null = null;
+  /** the ticket's stages, ground first, and the pass the laser is on (cutting stage pass + 1) */
+  private etchStages: HTMLImageElement[] = [];
+  private etchPass = 0;
+  /** the ticket's lettering: all of it, its marks, its owner, and over the finished artwork (to plan its pass) */
+  private etchCut: TicketCut | null = null;
+  private letteringTexs: (THREE.Texture | null)[] = [];
+  /** the ticket's bare colour field: what shows under the lettering, where the artwork isn't */
+  private plainGroundTex: THREE.Texture | null = null;
+  private etchPlan: LaserPlan | null = null;
+  private ticketGround: THREE.Texture | null = null;
   /** a photo uploaded for the Flower artwork, in place of the chosen flower; and a count that changes with it */
   private flowerUpload: string | null = null;
   private flowerVersion = 0;
@@ -408,7 +553,7 @@ export class HoloApp {
 
     this.scene = new THREE.Scene();
     this.scene.background = this.background;
-    this.camera = new THREE.PerspectiveCamera(38, width / height, 0.1, 200);
+    this.camera = new THREE.PerspectiveCamera(LENS_FOV, width / height, 0.1, 200);
     this.camera.position.set(...BAKED_POSE.camera);
 
     // image-based lighting and direct lights, by setup (Studio: a neutral
@@ -459,11 +604,10 @@ export class HoloApp {
     this.controls.dampingFactor = 0.08;
     this.controls.minDistance = 1.6;
     this.controls.maxDistance = 30;
-    // the baked view sat the subject left of centre to clear the panel; the
-    // view offset does that now (and only while the panel is out), so aim
-    // the camera at the subject itself
-    this.controls.target.set(...BAKED_POSE.target).x -= BAKED_PANEL_SHIFT;
-    this.camera.position.x -= BAKED_PANEL_SHIFT;
+    // the opening view: low, from behind and to the right, so the stack's
+    // die-cut edges catch the light
+    this.camera.position.set(...DEFAULT_VIEW.camera);
+    this.controls.target.set(...DEFAULT_VIEW.target);
     // a link can carry a view: ?cam=x,y,z&target=x,y,z
     const view = readCameraUrl();
     if (view) {
@@ -570,11 +714,11 @@ export class HoloApp {
     this.setCardMode(p.mode === 'Card');
     if (p.card) {
       this.card.setEtch(p.card.ink, p.card.etchDepth, p.card.etchBevel);
+      this.card.setOwnerFinish(p.card.owner ?? 'Mirror');
       this.card.setCorner(p.card.corner);
       this.card.setBack(p.card.back ?? 'Mirror');
     }
-    if (p.stack) this.card.setStack({ ...p.stack, cards: p.cards });
-    this.updatePlateArt(p);
+    this.applyStack();
     this.drama = p.card?.drama ?? 0.7;
     this.setCinematic(!!p.cinematic, p.card?.shotLength ?? 2.2);
     this.faceCollider.depth = p.physics.faceDepth;
@@ -649,7 +793,8 @@ export class HoloApp {
    * so dragging a slider doesn't queue up renders.
    */
   private updateGridArt(g: HoloParams['grid']) {
-    if (!g) return;
+    // a ticket in the making owns the card's face
+    if (!g || this.ticketing) return;
     const generated = g.pattern === 'Generated' || g.pattern === 'Growth' || g.pattern === 'Bars' || g.pattern === 'Flower' || g.pattern === 'Engine';
     const key = g.pattern === 'Generated'
       ? ['Generated', g.rows, g.depth, g.fill, g.endCircles, g.guides, g.seed].join('|')
@@ -681,85 +826,444 @@ export class HoloApp {
   }
 
   /**
-   * In a stack with Engine artwork, each plate gets its own: a few
-   * compositions from neighbouring seeds (the first is the card's own),
-   * cycled through the plates. Anything else and the plates share the card's.
+   * How many tickets there are, and how to fetch a range of them (in number
+   * order) — only what's about to be shown is. Each plate stays hidden until
+   * its ticket's image is in, then drops into place — never a plate without
+   * its own ticket.
    */
-  private updatePlateArt(p: HoloParams) {
-    const g = p.grid;
-    const on = p.cards === 'Stack' && g?.pattern === 'Engine';
-    const key = on ? ['Plates', g.engine, g.seed, g.layers].join('|') : '';
-    if (key === this.plateArtKey) return;
-    this.plateArtKey = key;
-    const job = ++this.plateArtJob;
-    if (!on) {
-      this.card.setPlateArt(null);
-      this.plateArt?.dispose();
-      this.plateArt = null;
-      return;
-    }
-    this.drawPlateArt(g, job).then((art) => {
-      if (job !== this.plateArtJob || this.disposed) {
-        art?.dispose();
-        return;
-      }
-      this.card.setPlateArt(art);
-      this.plateArt?.dispose();
-      this.plateArt = art;
-    }).catch((err) => console.error('[holocloth] plate art failed', err));
+  setTickets(total: number, fetch: (from: number, to: number) => Promise<TicketSource[]>) {
+    this.ticketTotal = total;
+    this.fetchTicketRange = fetch;
+    this.ticketAt.clear();
+    this.ticketIndex.clear();
+    this.pagesAsked.clear();
+    this.card.gatePlates(true);
+    this.applyStack();
   }
 
-  private async drawPlateArt(g: HoloParams['grid'], job: number) {
-    const field = await (this.gridField ??= fetchDataUrl('/artwork/field.png'));
-    const box = { x: ASCII.x0, y: ASCII.y0, w: ASCII.x1 - ASCII.x0, h: ASCII.y1 - ASCII.y0 };
-    const canvas = document.createElement('canvas');
-    canvas.width = PLATE_ART.w;
-    canvas.height = PLATE_ART.h;
-    const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
-    const layer = PLATE_ART.w * PLATE_ART.h * 4;
-    const data = new Uint8Array(layer * PLATE_ART.count);
-    const engine = g.engine ?? 'Random';
-    const layers = Math.round(g.layers ?? 3);
-    // drawn before (anywhere)? then just download it
-    const key = plateArtKey(engine, Math.round(g.seed), layers);
-    const cached = key ? await loadPlateArt(key, PLATE_ART.count) : null;
-    if (job !== this.plateArtJob) return null;
-    const fresh: Promise<Blob | null>[] = [];
-    for (let i = 0; i < PLATE_ART.count; i++) {
-      if (job !== this.plateArtJob) return null; // superseded: stop drawing
-      if (cached) {
-        ctx.clearRect(0, 0, PLATE_ART.w, PLATE_ART.h);
-        ctx.drawImage(cached[i], 0, 0, PLATE_ART.w, PLATE_ART.h);
-        cached[i].close();
-      } else {
-        // neighbouring seeds, so the stack belongs to the card's seed
-        const seed = ((Math.round(g.seed) - 1 + i * 97) % 999) + 1;
-        const linework = await engineLinework(engine, seed, box, layers);
-        const img = await loadImage(`data:image/svg+xml;charset=utf-8,${encodeURIComponent(pageWith(linework, field))}`);
-        ctx.drawImage(img, 0, 0, PLATE_ART.w, PLATE_ART.h);
-        if (key) fresh.push(new Promise((done) => canvas.toBlob(done, 'image/webp', 0.92)));
-      }
-      const px = ctx.getImageData(0, 0, PLATE_ART.w, PLATE_ART.h).data;
-      // rows bottom-up: texture arrays can't be flipped on upload
-      const row = PLATE_ART.w * 4;
-      for (let y = 0; y < PLATE_ART.h; y++) {
-        data.set(px.subarray(y * row, (y + 1) * row), i * layer + (PLATE_ART.h - 1 - y) * row);
-      }
-    }
-    // first to draw this set: keep it for everyone after
-    if (key && !cached) {
-      Promise.all(fresh).then((blobs) => {
-        if (blobs.every((b): b is Blob => b !== null)) savePlateArt(key, blobs, PLATE_ART.w, PLATE_ART.h);
+  /** the ticket at place k in number order, if fetched; if not, its page is asked for */
+  private ticketAtPlace(k: number) {
+    const t = this.ticketAt.get(k);
+    if (!t) this.askPage(Math.floor(k / TICKET_PAGE));
+    return t;
+  }
+
+  /** Fetch a page of tickets (once); a failed page is asked for again after a pause. */
+  private askPage(page: number) {
+    if (!this.fetchTicketRange || this.pagesAsked.has(page)) return;
+    this.pagesAsked.add(page);
+    const from = page * TICKET_PAGE;
+    this.fetchTicketRange(from, from + TICKET_PAGE - 1)
+      .then((list) => {
+        if (this.disposed) return;
+        list.forEach((t, j) => this.putTicket(from + j, t));
+        this.assignPlates();
+      })
+      .catch((err) => {
+        console.warn('[holocloth] a page of tickets failed; asking again shortly', err);
+        window.setTimeout(() => this.pagesAsked.delete(page), TICKET_RETRY_MS);
       });
+  }
+
+  private putTicket(k: number, t: TicketSource) {
+    this.ticketAt.set(k, t);
+    this.ticketIndex.set(t.id, k);
+  }
+
+
+  /**
+   * Making a ticket happens on the card itself: the stack folds down to the
+   * one card, and each new artwork is cut into it by the laser.
+   */
+  beginTicket() {
+    if (this.ticketing) return;
+    this.ticketing = true;
+    this.focusPlate(null);
+    this.applyStack();
+  }
+
+  /**
+   * Cut a ticket into the card, a pass of the laser per stage: from the bare
+   * ground, each engine layer in turn; and last its lettering (the page's
+   * marks, the owner's username and number), cut in the lettering's own
+   * finish — its own layer, never part of the artwork.
+   */
+  etchTicket(t: TicketCut) {
+    if (!this.ticketing || t.stages.length < 2) return;
+    this.etchStages = t.stages;
+    this.etchCut = t;
+    this.etchPass = 0;
+    this.plainGroundTex?.dispose();
+    this.plainGroundTex = new THREE.Texture(t.stages[0]);
+    this.plainGroundTex.colorSpace = THREE.SRGBColorSpace;
+    this.plainGroundTex.needsUpdate = true;
+    this.card.setFacePlainGround(this.plainGroundTex);
+    this.setLettering(false);
+    this.startPass();
+  }
+
+  /** A new username (or number): new lettering; once the laser has reached it, the card shows it at once. */
+  retitleTicket(t: TicketCut) {
+    if (!this.ticketing) return;
+    this.etchCut = { ...t, stages: this.etchStages };
+    const done = this.etch === null;
+    this.setLettering(done || this.etchPass >= this.etchStages.length - 1, done);
+  }
+
+  /**
+   * The lettering on the face: the artwork always keeps clear of it; once the
+   * laser reaches it the marks show, and the owner is cut — through the face
+   * as the laser goes, then through the card once it's done.
+   */
+  private setLettering(shown: boolean, through = false) {
+    const t = this.etchCut;
+    if (!t) return;
+    const tex = (img: HTMLImageElement | null) => {
+      if (!img) return null;
+      const out = new THREE.Texture(img);
+      out.needsUpdate = true;
+      return out;
+    };
+    for (const old of this.letteringTexs) old?.dispose();
+    this.letteringTexs = [tex(t.lettering), tex(t.marks), tex(t.owner)];
+    const [all, marks, owner] = this.letteringTexs;
+    this.card.setFaceLettering(all, marks, owner, shown ? (through ? 2 : 1) : 0);
+  }
+
+  /** a texture of a stage, for what the laser hasn't cut yet */
+  private setGround(img: HTMLImageElement) {
+    this.ticketGround?.dispose();
+    this.ticketGround = new THREE.Texture(img);
+    this.ticketGround.colorSpace = THREE.SRGBColorSpace;
+    this.ticketGround.needsUpdate = true;
+    this.card.setLaserGround(this.ticketGround);
+  }
+
+  /**
+   * The laser's next pass. A layer: what's cut so far is the ground, the next
+   * stage the artwork it cuts in. The lettering, last: the artwork stays as
+   * it is, and the lettering's own layer is cut in over it.
+   */
+  private startPass() {
+    const last = this.etchStages.length - 1;
+    const ground = this.etchStages[Math.min(this.etchPass, last)];
+    this.setGround(ground);
+    if (this.etchPass < last) {
+      const next = this.etchStages[this.etchPass + 1];
+      this.swapClothArt(next);
+      this.etchPlan = planPass(ground, next, this.etchCut?.lettering);
+    } else {
+      this.etchPlan = planPass(ground, this.etchCut!.lettered);
+      this.setLettering(true);
     }
-    const art = new THREE.DataArrayTexture(data, PLATE_ART.w, PLATE_ART.h, PLATE_ART.count);
+    this.card.setLaserPlan(this.etchPlan.times, LASER_COLS, LASER_ROWS, this.etchPlan.seconds);
+    this.etch = 0;
+    this.card.setLaser(0, headAt(this.etchPlan, 0), this.elapsed);
+  }
+
+  /** Done making (or put away): the card goes back to its artwork, and the stack unfolds. */
+  endTicket() {
+    if (!this.ticketing) return;
+    this.ticketing = false;
+    this.etch = null;
+    this.etchStages = [];
+    this.card.setLaser(null);
+    this.card.setFaceLettering(null, null, null, 0);
+    for (const old of this.letteringTexs) old?.dispose();
+    this.letteringTexs = [];
+    this.etchCut = null;
+    this.refreshGridArt();
+    this.applyStack();
+  }
+
+  /** Tickets are on their way: hold the stack's plates back until they arrive, rather than show them blank. */
+  awaitTickets() {
+    this.card.gatePlates(true);
+  }
+
+  /** A ticket made or remixed just now: its new image replaces the old, or it joins the end of the list. */
+  upsertTicket(t: TicketSource) {
+    const known = this.ticketIndex.get(t.id);
+    const old = known !== undefined ? this.ticketAt.get(known) : undefined;
+    if (old && old.url === t.url && old.owner === t.owner && old.number === t.number) return;
+    // a ticket not seen before is the newest: it joins the end
+    if (known !== undefined) this.putTicket(known, t);
+    else this.putTicket(this.ticketTotal++, t);
+    // a slot already holding it: load it afresh
+    const slot = this.slotOf.get(t.id);
+    if (slot !== undefined) {
+      this.slots[slot].ready = false;
+      this.plateTickets.forEach((id, p) => id === t.id && this.card.plateReady(p, false));
+      this.loadTicket(t, slot);
+    }
+    this.applyStack();
+  }
+
+  /** the ticket plate i shows: the Helix the latest few, Tiles every one as it scrolls */
+  private ticketForPlate(i: number) {
+    const n = this.ticketTotal;
+    if (this.tilesView) return this.ticketAtPlace(tileTicket(i, n, this.card.tilesScrollY, this.card.dims.h));
+    return this.ticketAtPlace(n - Math.min(n, HELIX_TICKETS) + i);
+  }
+
+  /**
+   * Give every plate its ticket: from the slot already holding it, or a
+   * free (or long-unused) one it's loaded into. Each frame in Tiles, as the
+   * wall scrolls; otherwise when the tickets change.
+   */
+  private assignPlates() {
+    if (!this.ticketTotal || !this.pool) return;
+    const frame = ++this.slotFrame;
+    // on the wall only what's on screen (and a card's width round it) has a
+    // ticket loaded: the drum's other cards, behind you or past the edges,
+    // let theirs go
+    const inView = this.tilesView ? this.platesInView() : null;
+    for (let i = 0; i < this.card.plateCount; i++) {
+      if (inView && !inView[i]) {
+        this.dropPlate(i);
+        continue;
+      }
+      const t = this.ticketForPlate(i);
+      if (!t) continue;
+      // its image failed a moment ago: try again in a while, not every frame
+      const failed = this.ticketFailed.get(t.id);
+      if (failed !== undefined && performance.now() - failed < TICKET_RETRY_MS) continue;
+      let slot = this.slotOf.get(t.id);
+      if (slot === undefined) {
+        const free = this.claimSlot(frame);
+        // the pool's full of what's on screen: this card waits, hidden, never showing another's image
+        if (free < 0) continue;
+        const was = this.slots[free].id;
+        if (was) {
+          this.slotOf.delete(was);
+          this.plateTickets.forEach((id, p) => id === was && this.dropPlate(p));
+        }
+        this.slots[free] = { id: t.id, ready: false, used: frame };
+        this.slotOf.set(t.id, free);
+        this.loadTicket(t, free);
+        slot = free;
+      }
+      this.slots[slot].used = frame;
+      if (this.plateTickets[i] !== t.id) {
+        this.plateTickets[i] = t.id;
+        this.card.setPlateLayer(i, slot);
+        this.card.plateReady(i, this.slots[slot].ready);
+      }
+    }
+  }
+
+  /** a plate lets its ticket go: hidden until it's given one again */
+  private dropPlate(i: number) {
+    if (!this.plateTickets[i]) return;
+    this.plateTickets[i] = null;
+    this.card.plateReady(i, false);
+  }
+
+  /** which plates are on screen, or within a card's width of it */
+  private platesInView() {
+    this.camera.updateMatrixWorld();
+    viewFrustum.setFromProjectionMatrix(viewMatrix.multiplyMatrices(this.camera.projectionMatrix, this.camera.matrixWorldInverse));
+    this.card.group.updateWorldMatrix(true, false);
+    const out: boolean[] = [];
+    for (let i = 0; i < this.card.plateCount; i++) {
+      viewSphere.center.copy(this.card.plateCentre(i, viewSphere.center));
+      viewSphere.radius = TILE_VIEW_MARGIN;
+      out.push(viewFrustum.intersectsSphere(viewSphere));
+    }
+    return out;
+  }
+
+  /** Size the plate art for the view: a new pool, its slots empty, refilled as plates are given tickets. */
+  private usePool(kind: PoolKind) {
+    if (this.pool === kind) return;
+    this.pool = kind;
+    this.ticketArt?.dispose();
+    this.ticketArt = null;
+    this.card.setPlateArt(null);
+    this.slots = Array.from({ length: POOLS[kind].count }, () => ({ id: null, ready: false, used: -1 }));
+    this.slotOf.clear();
+    // the drawing canvases are the pool's size
+    this.ticketCtx = this.marksCtx = this.ownerCtx = this.inkCtx = null;
+    for (let i = 0; i < this.card.plateCount; i++) this.card.plateReady(i, false);
+  }
+
+  /** a slot to load into: an empty one, or the one longest off every plate (never one on a plate this frame); -1 if none */
+  private claimSlot(frame: number) {
+    let best = -1;
+    for (let s = 0; s < this.slots.length; s++) {
+      const slot = this.slots[s];
+      if (!slot.id) return s;
+      if (slot.used === frame) continue;
+      if (best < 0 || slot.used < this.slots[best].used) best = s;
+    }
+    return best;
+  }
+
+  /** Pull a ticket's plate out to the front, once it's in. */
+  showTicket(id: string) {
+    const i = this.plateTickets.indexOf(id);
+    const slot = this.slotOf.get(id);
+    if (i >= 0 && slot !== undefined && this.slots[slot].ready) this.focusPlate(i);
+    else this.pendingShow = id;
+  }
+
+  private async loadTicket(t: TicketSource, slot: number) {
+    const pool = this.pool;
+    try {
+      const { ground, marks, owner, img } = await this.ticketLayers(t);
+      // the slot's gone to another ticket meanwhile (or this one's image has changed)
+      const at = this.ticketIndex.get(t.id);
+      const current = at !== undefined ? this.ticketAt.get(at) : undefined;
+      if (this.pool !== pool || this.slots[slot]?.id !== t.id || current?.url !== t.url || this.disposed) return img.close();
+      const art = (this.ticketArt ??= this.newTicketArt());
+      const { w, h } = POOLS[this.pool!];
+      const px = this.composeTicket({ ground, marks, owner, img }, w, h);
+      img.close();
+      if (!this.plateMarks) {
+        this.plateMarks = new THREE.Texture(marks);
+        this.plateMarks.needsUpdate = true;
+        this.card.setPlateMarks(this.plateMarks);
+      }
+      (art.image.data as Uint8Array).set(px, slot * w * h * 4);
+      art.addLayerUpdate(slot);
+      art.needsUpdate = true;
+      this.card.setPlateArt(art);
+      this.slots[slot].ready = true;
+      this.plateTickets.forEach((id, p) => id === t.id && this.card.plateReady(p));
+      if (this.pendingShow === t.id) {
+        this.pendingShow = null;
+        const p = this.plateTickets.indexOf(t.id);
+        if (p >= 0) this.focusPlate(p);
+      }
+    } catch (err) {
+      console.warn('[holocloth] ticket image failed; trying again shortly', t.url, err);
+      // free the slot, and let its plates try again after a pause
+      if (this.slots[slot].id === t.id) {
+        this.slots[slot] = { id: null, ready: false, used: -1 };
+        this.slotOf.delete(t.id);
+      }
+      this.ticketFailed.set(t.id, performance.now());
+      this.plateTickets = this.plateTickets.map((id) => (id === t.id ? null : id));
+      if (!this.tilesView) window.setTimeout(() => !this.disposed && this.assignPlates(), TICKET_RETRY_MS);
+    }
+  }
+
+  /**
+   * A ticket's layers laid one over another at w×h, upside down (texture
+   * arrays can't be flipped on upload): the colour field, its linework (never
+   * under the lettering), and the owner — cut right through — in the alpha.
+   * The page's marks are the same on every ticket: the card has them once.
+   */
+  private composeTicket(l: { ground: CanvasImageSource; marks: CanvasImageSource; owner: CanvasImageSource; img: CanvasImageSource }, w: number, h: number) {
+    const size = `${w}x${h}`;
+    if (this.composeSize !== size) {
+      this.composeSize = size;
+      this.composeCtx = [newCanvas(w, h), newCanvas(w, h), newCanvas(w, h), newCanvas(w, h)];
+    }
+    const [ctx, mctx, octx, ictx] = this.composeCtx!;
+    for (const c of [mctx, octx, ictx]) {
+      c.setTransform(1, 0, 0, -1, 0, h);
+      c.clearRect(0, 0, w, h);
+    }
+    mctx.drawImage(l.marks, 0, 0, w, h);
+    octx.drawImage(l.owner, 0, 0, w, h);
+    ictx.drawImage(l.img, 0, 0, w, h);
+    ictx.setTransform(1, 0, 0, 1, 0, 0);
+    ictx.globalCompositeOperation = 'destination-out';
+    ictx.drawImage(mctx.canvas, 0, 0);
+    ictx.drawImage(octx.canvas, 0, 0);
+    ictx.globalCompositeOperation = 'source-over';
+    ctx.setTransform(1, 0, 0, -1, 0, h);
+    ctx.drawImage(l.ground, 0, 0, w, h);
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.drawImage(ictx.canvas, 0, 0);
+    const px = ctx.getImageData(0, 0, w, h).data;
+    const ownerPx = octx.getImageData(0, 0, w, h).data;
+    for (let k = 3; k < px.length; k += 4) px[k] = 255 - ownerPx[k];
+    return px;
+  }
+
+  /** a ticket's layers, fetched: the colour field, the page's marks, its owner, its linework */
+  private ticketLayers(t: TicketSource) {
+    return Promise.all([
+      (this.ticketGroundImg ??= (this.gridField ??= fetchDataUrl('/artwork/field.png')).then((f) => svgImage(groundPage(f)))),
+      (this.ticketMarksImg ??= svgImage(marksPage())),
+      loadOwnerFont().then(() => svgImage(ownerPage({ username: t.owner, number: t.number }))),
+      fetch(t.url).then(async (res) => {
+        if (!res.ok) throw new Error(`${res.status}`);
+        return createImageBitmap(await res.blob());
+      }),
+    ]).then(([ground, marks, owner, img]) => ({ ground, marks, owner, img }));
+  }
+
+  /**
+   * The pulled-out card, drawn at full size: it fills the view, so its
+   * artwork is drawn for that, not at the size it has on the wall.
+   */
+  private async focusArtFor(plate: number | null) {
+    const job = ++this.focusJob;
+    const id = plate === null ? null : this.plateTickets[plate];
+    const at = id ? this.ticketIndex.get(id) : undefined;
+    const t = at !== undefined ? this.ticketAt.get(at) : undefined;
+    if (!t || plate === null) {
+      this.card.setFocusArt(null, -1);
+      return;
+    }
+    try {
+      const layers = await this.ticketLayers(t);
+      if (job !== this.focusJob || this.disposed) return layers.img.close();
+      const { w, h } = FOCUS_ART;
+      const px = this.composeTicket(layers, w, h);
+      layers.img.close();
+      this.focusArt?.dispose();
+      this.focusArt = new THREE.DataTexture(new Uint8Array(px.buffer.slice(0)), w, h);
+      this.focusArt.colorSpace = THREE.SRGBColorSpace;
+      this.focusArt.minFilter = THREE.LinearMipmapLinearFilter;
+      this.focusArt.magFilter = THREE.LinearFilter;
+      this.focusArt.generateMipmaps = true;
+      this.focusArt.anisotropy = 8;
+      this.focusArt.needsUpdate = true;
+      this.card.setFocusArt(this.focusArt, this.slotOf.get(t.id) ?? -1);
+    } catch (err) {
+      // the card just stays at the size it was: still shown, only softer
+      console.warn('[holocloth] full-size card failed; keeping the smaller one', err);
+    }
+  }
+
+  private newTicketArt() {
+    const { w, h, count } = POOLS[this.pool!];
+    const canvas = document.createElement('canvas');
+    canvas.width = w;
+    canvas.height = h;
+    this.ticketCtx = canvas.getContext('2d', { willReadFrequently: true })!;
+    const art = new THREE.DataArrayTexture(new Uint8Array(w * h * 4 * count), w, h, count);
     art.colorSpace = THREE.SRGBColorSpace;
     art.minFilter = THREE.LinearMipmapLinearFilter;
     art.magFilter = THREE.LinearFilter;
     art.generateMipmaps = true;
     art.anisotropy = 8;
-    art.needsUpdate = true;
     return art;
+  }
+
+  /** the stack's settings, with its count set by the tickets when it's made of them */
+  private applyStack() {
+    const p = this.params;
+    if (!p?.stack) return;
+    // Tiles is an endless sheet: more plates than tickets, the tickets repeating
+    const tiles = p.stack.shape === 'Tiles';
+    this.card.setStack({
+      ...p.stack,
+      cards: this.ticketing ? 'One' : p.cards,
+      count: tiles && this.ticketTotal ? TILE_COUNT : Math.min(this.ticketTotal, HELIX_TICKETS) || p.stack.count,
+    });
+    const tilesView = tiles && !this.ticketing && p.cards === 'Stack';
+    // into (or out of) Tiles, the camera eases round to suit
+    if (tilesView !== this.tilesView) this.frameView(tilesView ? 'Tiles' : 'Helix');
+    this.tilesView = tilesView;
+    this.controls.enabled = !tilesView;
+    this.usePool(tilesView ? 'Tiles' : 'Helix');
+    this.plateTickets = [];
+    this.assignPlates();
   }
 
   private async generateGridArt(g: HoloParams['grid']) {
@@ -1239,8 +1743,17 @@ export class HoloApp {
    * yours — by bringing the plate to the camera. Null puts it back (and the
    * camera, if it moved, returns to where it was).
    */
+  /**
+   * A pulled-out plate comes to the view, the camera staying put — with Move
+   * camera, and always inside the Tiles drum (flying the camera out to meet
+   * it would leave the drum)
+   */
+  private get cardComesToView() {
+    return this.params?.drag === 'Move camera' || this.tilesView;
+  }
+
   private focusPlate(plate: number | null) {
-    if (plate !== null && this.card.focusedPlate === null && this.plateCam.k === 0 && this.params?.drag !== 'Move camera') {
+    if (plate !== null && this.card.focusedPlate === null && this.plateCam.k === 0 && !this.cardComesToView) {
       this.plateCam.rest = {
         position: this.camera.position.clone(),
         target: this.controls.target.clone(),
@@ -1248,6 +1761,7 @@ export class HoloApp {
       };
     }
     this.card.focusPlate(plate);
+    this.focusArtFor(plate);
   }
 
   /** Ease the camera toward a pulled-out plate, or back to rest. */
@@ -1264,7 +1778,7 @@ export class HoloApp {
     if (focused && (!this.cardMode || !this.card.stacked || this.cine)) this.card.focusPlate(null);
     // Move camera: the plate comes to the view — centred, square to it,
     // filling most of the height — and follows it if you orbit
-    if (this.params?.drag === 'Move camera' && !c.rest) {
+    if (this.cardComesToView && !c.rest) {
       const { w, h } = this.card.dims;
       const half = Math.tan(THREE.MathUtils.degToRad(this.camera.fov) / 2);
       const fill = Math.max(h / 2, w / 2 / this.camera.aspect) / half / 0.8;
@@ -1310,7 +1824,7 @@ export class HoloApp {
 
   private startCardSpin(e: PointerEvent) {
     // Move camera: dragging the card orbits instead, and the view stays where it's left
-    if (this.params?.drag === 'Move camera') return;
+    if (this.cardComesToView) return;
     if (!this.raycastCard()) return; // empty space: let OrbitControls orbit
     this.card.dragging = true;
     this.cardDragId = e.pointerId;
@@ -1693,6 +2207,13 @@ export class HoloApp {
       const plate = this.card.plateAt(this.raycastCard());
       this.plateClick = { id: e.pointerId, x: e.clientX, y: e.clientY, plate };
       if (this.card.focusedPlate !== null) return; // the camera is on it: no spinning or orbiting
+      // Tiles: the sheet is dragged
+      if (this.tilesView) {
+        this.tileDrag = { id: e.pointerId, x: e.clientX, y: e.clientY, t: performance.now(), vx: 0, vy: 0 };
+        this.card.holdTiles(true);
+        this.renderer.domElement.setPointerCapture(e.pointerId);
+        return;
+      }
     }
     const hit = this.raycastCloth();
     if (!hit) {
@@ -1747,6 +2268,19 @@ export class HoloApp {
 
   private onPointerMove = (e: PointerEvent) => {
     this.pointerOver = true;
+    const drag = this.tileDrag;
+    if (drag && e.pointerId === drag.id) {
+      const now = performance.now();
+      const dt = Math.max(1, now - drag.t) / 1000;
+      const u = this.tileUnitsPerPx();
+      const dx = (e.clientX - drag.x) * u, dy = (e.clientY - drag.y) * u;
+      this.card.scrollTiles(dx, dy);
+      // the speed it's let go at, smoothed over the last few moves
+      drag.vx = drag.vx * 0.6 + (dx / dt) * 0.4;
+      drag.vy = drag.vy * 0.6 + (dy / dt) * 0.4;
+      Object.assign(drag, { x: e.clientX, y: e.clientY, t: now });
+      return;
+    }
     if (this.cardDragId !== null) {
       if (e.pointerId !== this.cardDragId) return;
       const now = performance.now();
@@ -1804,6 +2338,14 @@ export class HoloApp {
   }
 
   private onPointerUp = (e: PointerEvent) => {
+    const drag = this.tileDrag;
+    if (drag && e.pointerId === drag.id) {
+      this.tileDrag = null;
+      // a pause before letting go: no glide
+      const still = performance.now() - drag.t > 80;
+      this.card.holdTiles(false, still ? 0 : drag.vx, still ? 0 : drag.vy);
+      if (this.renderer.domElement.hasPointerCapture(e.pointerId)) this.renderer.domElement.releasePointerCapture(e.pointerId);
+    }
     const click = this.plateClick;
     if (click && e.pointerId === click.id) {
       this.plateClick = null;
@@ -1841,6 +2383,13 @@ export class HoloApp {
   };
 
   private onWheel = (e: WheelEvent) => {
+    // Tiles: the wheel (or trackpad) scrolls the sheet
+    if (this.tilesView && this.card.focusedPlate === null) {
+      e.preventDefault();
+      const u = this.tileUnitsPerPx();
+      this.card.scrollTiles(-e.deltaX * u, -e.deltaY * u);
+      return;
+    }
     if (!this.editMode) return;
     const sel = this.surface.selected;
     if (!sel) return;
@@ -1850,6 +2399,48 @@ export class HoloApp {
     this.surface.redraw();
     this.onDecalSelect?.(sel.scale, sel.rotation);
   };
+
+  /** Fade the Tiles wall behind a pulled-out tile: the veil, sized to the view just behind the tile. */
+  private updateVeil(dt: number) {
+    const v = this.veil;
+    const m = v.material as THREE.MeshBasicMaterial;
+    // follows whether a tile is out at all, not how far one is: going from
+    // one tile to the next, the wall stays faded
+    const goal = this.tilesView && this.card.focusedPlate !== null ? 1 : 0;
+    this.veilK = THREE.MathUtils.clamp(this.veilK + (goal ? dt : -dt) / VEIL_TIME, 0, 1);
+    const k = this.veilK * this.veilK * (3 - 2 * this.veilK);
+    m.opacity = TILE_VEIL * k;
+    v.visible = m.opacity > 0.001;
+    if (!v.visible) return;
+    if (!v.parent) {
+      // the veil rides with the camera, so the camera joins the scene
+      if (!this.camera.parent) this.scene.add(this.camera);
+      this.camera.add(v);
+    }
+    m.color.copy(this.background);
+    // just in front of the wall, so tiles on their way out or back stay in front of it
+    const d = TILE_VEIL_DIST;
+    const hgt = 2 * d * Math.tan(THREE.MathUtils.degToRad(this.camera.fov) / 2) * 1.2;
+    v.position.set(0, 0, -d);
+    v.scale.set(hgt * this.camera.aspect * 1.2, hgt, 1);
+  }
+
+  /** how far a screen pixel moves the Tiles wall, at the wall's distance from the middle */
+  private tileUnitsPerPx() {
+    const half = Math.tan(THREE.MathUtils.degToRad(this.camera.fov) / 2);
+    return (2 * TILE_RADIUS * half) / Math.max(1, this.host.clientHeight);
+  }
+
+  /** Ease the camera to a view: Helix from low at three-quarters, Tiles straight on. */
+  frameView(view: string) {
+    const tiles = view === 'Tiles';
+    const to = tiles ? TILES_VIEW : DEFAULT_VIEW;
+    this.camMove = {
+      from: [this.camera.position.clone(), this.controls.target.clone(), this.camera.fov],
+      to: [new THREE.Vector3(...to.camera), new THREE.Vector3(...to.target), tiles ? TILES_VIEW.fov : LENS_FOV],
+      k: 0,
+    };
+  }
 
   private onResize() {
     const width = this.host.clientWidth || window.innerWidth;
@@ -1884,7 +2475,24 @@ export class HoloApp {
     this.applyViewInset();
   }
 
+  /**
+   * One frame — guarded: a fault in it is reported (once per kind) and the
+   * next frame runs anyway, rather than the whole piece freezing on it.
+   */
   private tick = () => {
+    try {
+      this.frame();
+    } catch (err) {
+      const key = String((err as Error)?.message ?? err);
+      if (!this.frameFaults.has(key)) {
+        this.frameFaults.add(key);
+        console.error('[holocloth] a frame failed; carrying on', err);
+      }
+    }
+  };
+  private frameFaults = new Set<string>();
+
+  private frame() {
     if (this.disposed) return;
     // a stalled frame (a long task, a throttled window) is taken as a short one, not a leap
     const dt = Math.min(this.clock.getDelta(), MAX_DT);
@@ -1912,6 +2520,40 @@ export class HoloApp {
 
     if (this.cine) this.runCinematic();
     if (this.cardMode) this.card.update(dt, this.elapsed);
+    if (this.camMove) {
+      const m = this.camMove;
+      m.k = Math.min(1, m.k + dt / 1.2);
+      const e = m.k < 0.5 ? 4 * m.k ** 3 : 1 - (-2 * m.k + 2) ** 3 / 2;
+      this.camera.position.lerpVectors(m.from[0], m.to[0], e);
+      this.controls.target.lerpVectors(m.from[1], m.to[1], e);
+      this.camera.up.set(0, 1, 0);
+      this.camera.lookAt(this.controls.target);
+      this.camera.fov = THREE.MathUtils.lerp(m.from[2], m.to[2], e);
+      this.camera.updateProjectionMatrix();
+      if (m.k >= 1) this.camMove = null;
+    }
+    // the laser waits for the stack to fold down to the one card, then cuts a pass per stage
+    if (this.etch !== null) {
+      const plan = this.etchPlan!;
+      if (this.cardMode && !this.card.stacked) this.etch = Math.min(1, this.etch + dt / plan.seconds);
+      if (this.etch < 1) {
+        const head = headAt(plan, this.etch);
+        this.card.setLaser(this.etch, head, this.elapsed);
+        if (this.elapsed - this.laserReported > 0.07) {
+          this.laserReported = this.elapsed;
+          this.onLaser?.({ pass: this.etchPass, passes: this.etchStages.length, progress: this.etch, u: head.u, v: head.v, firing: head.firing });
+        }
+      } else if (this.etchPass + 1 < this.etchStages.length) {
+        this.etchPass++;
+        this.startPass();
+      } else {
+        this.etch = null;
+        this.card.setLaser(null);
+        // cut through: the owner's letters open right through the card
+        this.setLettering(true, true);
+        this.onLaser?.(null);
+      }
+    }
     if (this.params && !this.cardMode) {
       const face = this.faceTracker?.poll();
       if (face) this.faceCollider.update(face);
@@ -1967,14 +2609,34 @@ export class HoloApp {
 
     this.updatePlateCamera(dt);
     // the reel places the camera itself; damped controls would ease its cuts
-    if (!this.cine && this.plateCam.k === 0) this.controls.update();
+    // Tiles is dragged and scrolled, never orbited: whatever else turned the
+    // controls back on this frame, they stay off
+    if (this.tilesView) {
+      this.controls.enabled = false;
+      // the wall's rows come and go as it scrolls: their tickets with them
+      this.assignPlates();
+    }
+    this.updateVeil(dt);
+    // Tiles is lit up, easing in and out with the view
+    this.viewLight += ((this.tilesView ? TILES_LIGHT : 1) - this.viewLight) * (1 - Math.exp(-3 * dt));
+    if (this.params && !this.cine) {
+      this.renderer.toneMappingExposure = this.params.render.exposure * this.viewLight;
+      this.scene.environmentIntensity = this.params.render.environment * this.viewLight;
+      // and its light comes from higher: the room tipped so the bright band
+      // the wall reflects rides up toward its top, not across its middle
+      const tip = ((this.viewLight - 1) / (TILES_LIGHT - 1)) * TILES_LIGHT_TIP;
+      this.scene.environmentRotation.x = tip;
+      this.lightRig.rotation.x = tip;
+    }
+    if (!this.cine && this.plateCam.k === 0 && !this.camMove) this.controls.update();
     this.composer.render();
-  };
+  }
 
   dispose() {
     this.disposed = true;
     if (this.cameraUrlTimer !== null) window.clearTimeout(this.cameraUrlTimer);
-    this.plateArt?.dispose();
+    this.ticketArt?.dispose();
+    this.ticketGround?.dispose();
     this.lighting.dispose();
     this.faceTracker?.stop();
     this.handTracker?.stop();

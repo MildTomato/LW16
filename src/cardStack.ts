@@ -6,7 +6,32 @@ import * as THREE from 'three';
  * twisting form and its edges catch the light in rhythm. Every arrangement
  * is a rule, not a scatter — plate i's place follows from i alone.
  */
-export const STACK_SHAPES = ['Single', 'Twist', 'Wave', 'Fan', 'Bloom', 'Möbius', 'Ring', 'Flip', 'Helix', 'Vortex'] as const;
+export const STACK_SHAPES = ['Single', 'Twist', 'Wave', 'Fan', 'Bloom', 'Möbius', 'Ring', 'Flip', 'Helix', 'Vortex', 'Tiles'] as const;
+/**
+ * Tiles: a curved wall — the inside of a drum, this many columns round, of
+ * this many plates (the tickets repeat to fill it). You stand at its middle.
+ */
+export const TILE_COLS = 24;
+export const TILE_COUNT = 120;
+const TILE_SCALE = 0.42;
+/** a column's width round the drum, and the drum's radius that fits them all */
+const TILE_CELL_W = 2 * TILE_SCALE * 1.14;
+export const TILE_RADIUS = (TILE_COLS * TILE_CELL_W) / (Math.PI * 2);
+
+/**
+ * Which of n tickets (in order) Tiles plate i shows, the wall scrolled by
+ * scrollY: row by row down the wall, a row of the drum's columns each,
+ * round again after the last — so scrolling goes through every ticket.
+ */
+export function tileTicket(i: number, n: number, scrollY: number, h: number) {
+  const ch = h * TILE_SCALE * 1.12;
+  const rows = Math.ceil(TILE_COUNT / TILE_COLS);
+  const base = Math.floor(i / TILE_COLS);
+  // the row this plate has wrapped round to (as laid out in plateMatrix)
+  const row = base - rows * Math.floor((base * ch + scrollY) / (rows * ch));
+  const k = (row * TILE_COLS + (i % TILE_COLS)) % n;
+  return k < 0 ? k + n : k;
+}
 export type StackShape = (typeof STACK_SHAPES)[number];
 /** the panel's choices: a shape, or Cycle through them all */
 export const STACK_OPTIONS = [...STACK_SHAPES, 'Cycle'] as const;
@@ -57,6 +82,8 @@ export function plateMatrix(
   /** opens the formation out (radius, rise) to clear collisions; 1 = as designed */
   spread = 1,
   out = new THREE.Matrix4(),
+  /** Tiles: how far the wall's been turned and scrolled */
+  scroll: TileState = NO_SCROLL,
 ) {
   // 0..1 along the form
   const f = n > 1 ? i / (n - 1) : 0;
@@ -100,13 +127,31 @@ export function plateMatrix(
       s.setScalar(scale);
       return out.compose(p, q, s);
     }
+    case 'Tiles': {
+      // the inside of a drum, facing its middle: dragged round it's endless,
+      // and every column faces you a little differently, so the light varies
+      // across the wall. Rows wrap round top to bottom out of view, a tile
+      // shrinking away to nothing at the wrap.
+      const ch = h * TILE_SCALE * 1.12;
+      const rows = Math.ceil(n / TILE_COLS);
+      const H = rows * ch;
+      const wrap = (v: number, m: number) => ((v % m) + m) % m;
+      const a = ((i % TILE_COLS) * TILE_CELL_W + scroll.x) / TILE_RADIUS;
+      const y = -(wrap(Math.floor(i / TILE_COLS) * ch + scroll.y, H) - H / 2 + ch / 2);
+      const k = THREE.MathUtils.smoothstep((H / 2 - Math.abs(y)) / ch, 0, 0.6);
+      q.setFromAxisAngle(Y, -a);
+      p.set(TILE_RADIUS * Math.sin(a), y, -TILE_RADIUS * Math.cos(a));
+      s.setScalar(TILE_SCALE * Math.max(1e-3, k));
+      return out.compose(p, q, s);
+    }
     case 'Helix': {
       // a spiral stair: plates rise up the y axis, each turned about it
       const scale = 0.55;
       const turn = twist * Math.PI * 2;
       q.setFromAxisAngle(Y, f * turn + phase * Math.PI * 2);
-      // lying almost flat, stepping up
-      q.multiply(LIE);
+      // lying almost flat, stepping up — turned a quarter in its own plane,
+      // so its right edge (where a ticket's username and number run) faces out
+      q.multiply(LIE).multiply(EDGE_OUT);
       const rise = Math.max(gap * 2.2, (h * 1.2) / Math.max(1, n)) * spread;
       p.set(0, (i - (n - 1) / 2) * rise, 0);
       s.setScalar(scale);
@@ -182,8 +227,9 @@ function ringSlat(phi: number, chi: number, R: number, q: THREE.Quaternion, p: T
 const X = new THREE.Vector3(1, 0, 0);
 const Y = new THREE.Vector3(0, 1, 0);
 const Z = new THREE.Vector3(0, 0, 1);
-/** a Helix plate lying almost flat */
+/** a Helix plate lying almost flat, its right edge to the front */
 const LIE = new THREE.Quaternion().setFromAxisAngle(X, -Math.PI / 2 + 0.35);
+const EDGE_OUT = new THREE.Quaternion().setFromAxisAngle(Z, -Math.PI / 2);
 
 /** a pulled-out plate's spot, in the stack's space; pushed further out when the formation is deeper */
 export const FRONT = new THREE.Vector3(0, 0, 1.4);
@@ -194,6 +240,12 @@ const PULL = 1.1;
 /** how long a hovered plate takes to pop out (s), and how far: a fraction of its short side */
 const HOVER = 0.18;
 const POP = 0.18;
+/** seconds a tile takes to come off the wall to the viewer, or go back */
+const TILE_PULL = 0.45;
+/** how quickly a let-go Tiles wall slows (per second) */
+const TILE_GLIDE = 3;
+/** seconds a ticket's plate takes to drop into place once its artwork is in */
+const APPEAR = 0.7;
 
 const ease = (x: number) => (x < 0.5 ? 4 * x * x * x : 1 - (-2 * x + 2) ** 3 / 2);
 
@@ -266,7 +318,10 @@ function overlaps(A: Box, B: Box) {
  * Formations whose plates all lie parallel, a gap apart, can't touch
  * whatever they do within their planes. The rest are checked.
  */
-const PARALLEL = new Set<StackShape>(['Single', 'Twist', 'Wave', 'Fan', 'Bloom']);
+const PARALLEL = new Set<StackShape>(['Single', 'Twist', 'Wave', 'Fan', 'Bloom', 'Tiles']);
+/** Tiles: how far the wall's been turned (round, x) and scrolled (y), in stack units */
+export type TileState = { x: number; y: number };
+const NO_SCROLL: TileState = { x: 0, y: 0 };
 
 /** whether any two plates of a formation touch, at a few points through its flow */
 function collides(shape: StackShape, n: number, w: number, h: number, t: number, params: StackParams, spread: number) {
@@ -322,6 +377,18 @@ export class StackAnimator {
   /** the plate under the pointer, and how far each has popped out (0..1) */
   private hover: number | null = null;
   private lift = new Float32Array(MAX_PLATES);
+  /** Tiles: how far the sheet's been moved, and how fast it's still going once let go */
+  private scroll = new THREE.Vector2();
+  private scrollVel = new THREE.Vector2();
+  private scrolling = false;
+
+  /**
+   * Plates made of tickets wait for their artwork: hidden until it's in,
+   * then they drop into place. Ungated, every plate is simply there.
+   */
+  private gated = false;
+  private ready = new Uint8Array(MAX_PLATES);
+  private shown = new Float32Array(MAX_PLATES).fill(1);
   /** each plate's place in the formation this frame, worked out once */
   private places: THREE.Matrix4[] = [];
   /** each formation's clearing spread, for the settings it was worked out at */
@@ -367,6 +434,40 @@ export class StackAnimator {
   /** The plate under the pointer pops out a little; null lets it settle back. */
   setHover(i: number | null) {
     this.hover = i;
+  }
+
+  /** Tiles: turn and scroll the wall (stack units) — held (dragging), or let go with a speed it glides on at. */
+  scrollBy(dx: number, dy: number) {
+    this.scroll.x += dx;
+    this.scroll.y += dy;
+  }
+
+  /** Tiles: how far the wall's been scrolled down */
+  get scrollY() {
+    return this.scroll.y;
+  }
+
+  holdScroll(held: boolean, vx = 0, vy = 0) {
+    this.scrolling = held;
+    this.scrollVel.set(held ? 0 : vx, held ? 0 : vy);
+  }
+
+  /** Show only the plates whose artwork is in (true), or every plate (false). */
+  gate(on: boolean) {
+    if (on === this.gated) return;
+    this.gated = on;
+    if (on) {
+      this.ready.fill(0);
+      this.shown.fill(0);
+    } else {
+      this.shown.fill(1);
+    }
+  }
+
+  /** Plate i's artwork is in (it drops into place), or gone again (it vanishes until the next is). */
+  setReady(i: number, ready = true) {
+    this.ready[i] = ready ? 1 : 0;
+    if (!ready) this.shown[i] = 0;
   }
 
   /** true when every plate sits on the single card (draw the plain card instead) */
@@ -423,6 +524,11 @@ export class StackAnimator {
     params: StackParams,
   ) {
     this.phase += params.flow * dt * 0.06;
+    // a let-go sheet glides on, slowing
+    if (!this.scrolling && this.scrollVel.lengthSq() > 1e-6) {
+      this.scroll.addScaledVector(this.scrollVel, dt);
+      this.scrollVel.multiplyScalar(Math.exp(-TILE_GLIDE * dt));
+    }
     if (this.move < 1) {
       this.move = Math.min(1, this.move + dt / MOVE);
     } else if (this.cycling) {
@@ -441,7 +547,7 @@ export class StackAnimator {
     let reach = 0, deepest = -Infinity;
     for (let i = 0; i < n; i++) {
       const place = (this.places[i] ??= new THREE.Matrix4());
-      plateMatrix(this.shape, i, n, w, h, t, params, this.phase, spreadTo, place);
+      plateMatrix(this.shape, i, n, w, h, t, params, this.phase, spreadTo, place, this.scroll);
       pb.setFromMatrixPosition(place);
       reach = Math.max(reach, pb.length());
       deepest = Math.max(deepest, pb.z);
@@ -459,7 +565,7 @@ export class StackAnimator {
         const start = n > 1 ? (i / (n - 1)) * stagger : 0;
         const k = ease(THREE.MathUtils.clamp((this.move - start) / (1 - stagger), 0, 1));
         if (k < 1) {
-          plateMatrix(this.from, i, n, w, h, t, params, this.phase, spreadFrom, ma);
+          plateMatrix(this.from, i, n, w, h, t, params, this.phase, spreadFrom, ma, this.scroll);
           ma.decompose(pa, qa, sa);
           mb.decompose(pb, qb, sb);
           pa.lerp(pb, k);
@@ -474,11 +580,14 @@ export class StackAnimator {
       }
       // a plate pulled out (or on its way back) leaves its slot for the front
       const target = i === this.focus ? 1 : 0;
-      const o = (this.out[i] += THREE.MathUtils.clamp(target - this.out[i], -dt / PULL, dt / PULL));
+      const pull = this.shape === 'Tiles' ? TILE_PULL : PULL;
+      const o = (this.out[i] += THREE.MathUtils.clamp(target - this.out[i], -dt / pull, dt / pull));
       // hovered: eased a little way out of the formation, within its own plane
       const lifted = (this.lift[i] += THREE.MathUtils.clamp((i === this.hover && o === 0 ? 1 : 0) - this.lift[i], -dt / HOVER, dt / HOVER));
-      if (lifted > 0) this.popOut(mb, ease(lifted) * Math.min(w, h) * POP);
-      if (o > 0) this.pullOut(mb, ease(o), reach);
+      if (lifted > 0) this.popOut(mb, ease(lifted) * Math.min(w, h) * POP, this.shape === 'Tiles');
+      if (o > 0) this.pullOut(mb, ease(o), reach, this.shape === 'Tiles');
+      const shown = (this.shown[i] += THREE.MathUtils.clamp((this.gated ? this.ready[i] : 1) - this.shown[i], 0, dt / APPEAR));
+      if (shown < 1) this.dropIn(mb, ease(shown), h);
       for (const mesh of meshes) mesh.setMatrixAt(i, mb);
     }
     for (const mesh of meshes) {
@@ -489,17 +598,28 @@ export class StackAnimator {
     }
   }
 
+  /** A plate on its way in (k 0..1): falling into its place from above, growing as it comes. */
+  private dropIn(m: THREE.Matrix4, k: number, h: number) {
+    m.decompose(pa, qa, sa);
+    pa.y += (1 - k) * h * 0.9;
+    sa.multiplyScalar(Math.max(1e-3, k));
+    m.compose(pa, qa, sa);
+  }
+
   /**
    * A plate nudged `by` out of the formation: within its own plane, away
    * from the middle (out of a ring, off the end of a fan), never into its
    * neighbours.
    */
-  private popOut(m: THREE.Matrix4, by: number) {
+  private popOut(m: THREE.Matrix4, by: number, toward = false) {
     m.decompose(pa, qa, sa);
     nrm.copy(Z).applyQuaternion(qa);
     away.copy(pa).addScaledVector(nrm, -pa.dot(nrm));
-    // a plate on the axis (a straight stack) pops toward the viewer instead
-    if (away.lengthSq() < 1e-4) away.copy(nrm);
+    // a plate on the axis (a straight stack), or a tile in a sheet, lifts toward the viewer instead
+    if (toward || away.lengthSq() < 1e-4) {
+      away.copy(nrm);
+      by *= toward ? 0.35 : 1;
+    }
     pa.addScaledVector(away.normalize(), by);
     m.compose(pa, qa, sa);
   }
@@ -511,8 +631,19 @@ export class StackAnimator {
    * everything; then comes forward, turning to face the viewer; then slides
    * in to the middle.
    */
-  private pullOut(m: THREE.Matrix4, k: number, reach: number) {
+  private pullOut(m: THREE.Matrix4, k: number, reach: number, straight = false) {
     m.decompose(pa, qa, sa);
+    // a tile comes straight off the wall to the viewer: nothing's in its way
+    if (straight) {
+      const dest = this.present?.position ?? this.front;
+      const destQ = this.present?.quaternion ?? FACE_ON;
+      pb.copy(pa).lerp(dest, k);
+      qb.copy(qa).slerp(destQ, k);
+      if (k > 0.7) qb.multiply(lean.identity().slerp(this.tilt, (k - 0.7) / 0.3));
+      sb.copy(sa).lerp(ONE, k).multiplyScalar(THREE.MathUtils.lerp(1, this.present?.scale ?? 1, k));
+      m.compose(pb, qb, sb);
+      return;
+    }
     // within the plate's plane, away from the formation's middle
     nrm.copy(Z).applyQuaternion(qa);
     away.copy(pa).addScaledVector(nrm, -pa.dot(nrm));
