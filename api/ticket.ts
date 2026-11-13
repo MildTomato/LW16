@@ -79,6 +79,21 @@ function store() {
   };
 }
 
+/** the light the ticket's shown in: one of the scene's lightings by name, or none */
+const cardLighting = (raw: unknown) => (typeof raw === 'string' && /^[A-Za-z ]{1,40}$/.test(raw) ? raw : null);
+
+/** the stickers, as plain numbers and known-shaped ids, at most a dozen */
+function ticketStickers(raw: unknown) {
+  if (!Array.isArray(raw)) return [];
+  const num = (v: unknown, lo: number, hi: number) => (typeof v === 'number' && Number.isFinite(v) ? Math.min(hi, Math.max(lo, v)) : null);
+  return raw.slice(0, 12).flatMap((s) => {
+    const o = s as Record<string, unknown>;
+    const id = typeof o.id === 'string' && /^[a-z0-9-]{1,32}$/.test(o.id) ? o.id : null;
+    const u = num(o.u, 0, 1), v = num(o.v, 0, 1), scale = num(o.scale, 0.02, 1), rotation = num(o.rotation, -360, 360);
+    return id && u !== null && v !== null && scale !== null && rotation !== null ? [{ id, u, v, scale, rotation }] : [];
+  });
+}
+
 /** the request as a Web Request, so FormData can read the multipart body */
 async function webRequest(req: IncomingMessage): Promise<Request> {
   const chunks: Buffer[] = [];
@@ -132,6 +147,8 @@ export default async function handler(req: IncomingMessage, res: ServerResponse)
       engine_rev: String(draft.engine_rev ?? 'unknown'),
       image_path: path,
       composition: Array.isArray(draft.composition) ? draft.composition : [],
+      lighting: cardLighting(draft.lighting),
+      stickers: ticketStickers(draft.stickers),
     });
     if (error) {
       if (error.code === '23505' && /username/i.test(`${error.message} ${error.details ?? ''}`)) {

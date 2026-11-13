@@ -1,3 +1,4 @@
+import { PAGE } from './gridArt.ts';
 /**
  * A laser engraver's job for one pass: compare what's on the card with what
  * it should become, find the new ink, and plan the head's route. It goes
@@ -108,7 +109,7 @@ export function planPass(
   let forward = true;
   const moveTo = (row: number, u: number) => {
     if (!at) return;
-    const cost = Math.hypot(u - at.u, ((row - at.row) / LASER_ROWS) * 1.5) * MOVE_COST + TURN;
+    const cost = Math.hypot(u - at.u, ((row - at.row) / LASER_ROWS) * (PAGE.h / PAGE.w)) * MOVE_COST + TURN;
     segments.push({ t0: work, t1: work + cost, row0: at.row, row, x0: at.u, x1: u, cut: false });
     work += cost;
   };

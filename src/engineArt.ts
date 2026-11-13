@@ -5,6 +5,8 @@
  * only found when it's checked out; a build without it (Vercel) still works
  * and simply doesn't offer it.
  */
+import { ASCII } from './gridArt.ts';
+
 const ENGINE = import.meta.glob('../visual-engine-generator/src/engine/composition.ts');
 
 /** wireframes in white, so they print (the engine's own line colour is near-black) */
@@ -44,6 +46,7 @@ type EngineLayer = {
   opacity: number;
   tf: { x: number; y: number; scale: number; rot: number };
   clip: { mode: string; x: number; y: number; w: number; h: number; rot: number };
+  fit?: { on: boolean; pad: number; mode?: string };
 };
 type EngineModule = {
   createLayer(genId: string, params?: Record<string, unknown>): EngineLayer;
@@ -79,7 +82,7 @@ const layerFor = (engine: EngineModule, name: string) => {
 
 /**
  * Random layers: the first fills the page; each one over it is moved,
- * scaled and turned, sometimes clipped to a shape, and a little lighter —
+ * scaled and turned, and a little lighter —
  * the engine's own layering, chosen by the seed.
  */
 async function randomLayers(engine: EngineModule, seed: number, count: number) {
@@ -95,11 +98,15 @@ async function randomLayers(engine: EngineModule, seed: number, count: number) {
 }
 
 /**
- * Where a layer over the first sits: moved, scaled and turned, sometimes
- * clipped to a shape, and a little lighter (the first fills the page).
+ * Where a layer over the first sits: moved, scaled and turned, and a little
+ * lighter (the first fills the page).
  */
 function placeLayer(layer: EngineLayer, i: number, r: () => number) {
-  if (i === 0) return layer;
+  // the first fills the box, fitted inside it so nothing of it is sliced off at the edge
+  if (i === 0) {
+    layer.fit = { on: true, pad: 0.04, mode: 'shrink' };
+    return layer;
+  }
   const clips = ['circle', 'ellipse', 'rect', 'triangle'];
   layer.tf = {
     x: Math.round((r() - 0.5) * 30) / 100,
@@ -108,13 +115,43 @@ function placeLayer(layer: EngineLayer, i: number, r: () => number) {
     rot: r() < 0.5 ? 0 : Math.round((r() - 0.5) * 90),
   };
   layer.opacity = Math.round((0.55 + r() * 0.45) * 100) / 100;
+  keepInside(layer);
+  // layers used to be clipped to a shape now and then; that read as the artwork
+  // being cut off, so they're never clipped now. The shape's still drawn from
+  // the seed (and thrown away) so every seed keeps the rest of its placement.
   if (r() < 0.4) {
-    layer.clip = {
+    void {
       mode: clips[Math.floor(r() * clips.length)],
       x: 0.3 + r() * 0.4, y: 0.3 + r() * 0.4, w: 0.35 + r() * 0.45, h: 0.35 + r() * 0.45, rot: Math.round(r() * 90),
     };
   }
   return layer;
+}
+
+/**
+ * A layer over the first, kept whole inside the artwork's box: its drawing
+ * fitted to the box (the engine's own fit), and its move, scale and turn
+ * held to what keeps all of it in, so no edge of it is ever sliced off by
+ * the box. The seed's choices stand; they're only reined in.
+ */
+function keepInside(layer: EngineLayer) {
+  layer.fit = { on: true, pad: 0.04, mode: 'shrink' };
+  // the box's shape, its height 1: the fitted drawing is at most this, before the move
+  const A = (ASCII.x1 - ASCII.x0) / (ASCII.y1 - ASCII.y0);
+  const a = (layer.tf.rot * Math.PI) / 180;
+  const c = Math.abs(Math.cos(a)), sn = Math.abs(Math.sin(a));
+  // turned, the drawing's half extents per unit of scale; the scale that keeps it inside
+  const most = Math.min(A / (A * c + sn), 1 / (A * sn + c));
+  const scale = Math.min(layer.tf.scale, most);
+  const ex = ((A * c + sn) * scale) / 2, ey = ((A * sn + c) * scale) / 2;
+  // what's left either side is how far it can move (x is a fraction of the box's width, y of its height)
+  const roomX = Math.max(0, (A / 2 - ex) / A), roomY = Math.max(0, 0.5 - ey);
+  layer.tf = {
+    ...layer.tf,
+    scale: Math.floor(scale * 100) / 100,
+    x: Math.max(-roomX, Math.min(roomX, layer.tf.x)),
+    y: Math.max(-roomY, Math.min(roomY, layer.tf.y)),
+  };
 }
 
 /** the systems a design picks from at random: the linework ones (the heavy masses can still be chosen) */

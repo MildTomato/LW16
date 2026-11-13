@@ -23,9 +23,14 @@ export interface GridOptions {
   seed: number;
 }
 
-// same page, unit and line as public/artwork/construction.svg
-const W = 2000;
-const H = 3000;
+/**
+ * A ticket's page: square. (The construction drawing it grew from,
+ * public/artwork/construction.svg, was 2000 x 3000: the margins, unit and
+ * line are still its own, with the bottom margin measured up from the foot.)
+ */
+export const PAGE = { w: 2000, h: 3000 };
+const W = PAGE.w;
+const H = PAGE.h;
 const UNIT = 229;
 /** the original's frame: two squares, 4 units by 2 */
 const FRAME_W = 4 * UNIT;
@@ -33,9 +38,9 @@ const STROKE = '#1a1a1a';
 const STROKE_W = 2;
 /** the margin rule between the labels (see marginMarks) */
 const RULE_X = 100;
-const RULE_BOTTOM = 2826;
-/** Growth's outer square: full width, 7 x 256 so every halving stays on whole pixels */
-const GROWTH_SIDE = 1792;
+const RULE_BOTTOM = H - 174;
+/** Growth's outer square: as large as fits between the margins, in steps of 256 so every halving stays on whole pixels */
+const GROWTH_SIDE = Math.min(1792, Math.floor((RULE_BOTTOM - 176) / 256) * 256);
 
 /** small, fast, seedable PRNG so a seed always gives the same drawing */
 function mulberry32(seed: number) {
@@ -142,9 +147,9 @@ export const loadOwnerFont = () =>
 /** Corner labels and the margin rule between them — identical in construction.svg. */
 const marginMarks = () => `<g fill="#1a1a1a" stroke="none" font-family="${MARK_FONT}" font-size="44" font-weight="300" letter-spacing="0.5">
     <text x="100" y="132">Petabyte</text>
-    <text x="100" y="2900">Prototype</text>
+    <text x="100" y="${H - 100}">Prototype</text>
   </g>
-  <line x1="100" y1="176" x2="100" y2="2826" stroke="#1a1a1a" stroke-width="2"/>`;
+  <line x1="100" y1="176" x2="100" y2="${RULE_BOTTOM}" stroke="#1a1a1a" stroke-width="2"/>`;
 const escapeXml = (t: string) => t.replace(/[<>&"']/g, (c) => `&#${c.charCodeAt(0)};`);
 
 /** Full page: the colour field (as a data URL) under the generated linework. */
@@ -444,6 +449,38 @@ export function ditherLinework(lum: Float32Array, cols: number, rows: number, st
     }
   }
   return `<path fill="${STROKE}" stroke="none" d="${d}"/>`;
+}
+
+/**
+ * A photo (a webcam shot) etched: cropped to fill the artwork's box, levelled,
+ * and dithered into square pixels where it's dark, so a face reads the right
+ * way round in dark ink on bright metal.
+ */
+export async function photoLinework(src: string, style = 'Atkinson', size = 'Small'): Promise<string> {
+  const { cols, rows } = ditherGrid(size, style);
+  const img = await loadImage(src);
+  const canvas = document.createElement('canvas');
+  canvas.width = cols;
+  canvas.height = rows;
+  const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
+  ctx.imageSmoothingQuality = 'high';
+  // cover the box: crop the photo to its shape, centred
+  const k = Math.max(cols / img.width, rows / img.height);
+  const w = cols / k, h = rows / k;
+  ctx.drawImage(img, (img.width - w) / 2, (img.height - h) / 2, w, h, 0, 0, cols, rows);
+  const px = ctx.getImageData(0, 0, cols, rows).data;
+  const raw = new Float32Array(cols * rows);
+  for (let i = 0; i < raw.length; i++) raw[i] = (0.299 * px[i * 4] + 0.587 * px[i * 4 + 1] + 0.114 * px[i * 4 + 2]) / 255;
+  // its own range over the whole ramp, trimmed of outliers, then turned over: dark is ink
+  const sorted = Array.from(raw).sort((a, b) => a - b);
+  const lo = sorted[Math.floor(sorted.length * 0.02)], hi = sorted[Math.floor(sorted.length * 0.98)];
+  const lum = new Float32Array(cols * rows);
+  for (let i = 0; i < raw.length; i++) {
+    const v = Math.max(0, Math.min(1, (raw[i] - lo) / Math.max(0.05, hi - lo)));
+    // the brightest stays clear metal; the rest is ink, darker for darker
+    lum[i] = v > 0.92 ? 0 : (1 - v) ** 1.2;
+  }
+  return ditherLinework(lum, cols, rows, style, size);
 }
 
 export function ditherSvg(lum: Float32Array, cols: number, rows: number, fieldDataUrl: string, style: string, size?: string): string {

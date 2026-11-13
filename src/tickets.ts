@@ -8,7 +8,7 @@
 import { createClient, type RealtimeChannel } from '@supabase/supabase-js';
 import { accountToken } from './account.ts';
 import { ENGINE_AVAILABLE, engineStages, randomDesignLayer, type DesignLayer } from './engineArt.ts';
-import { ASCII, fetchDataUrl, groundPage, inkPage, plainGroundPage, loadImage, loadOwnerFont, marksPage, ownerPage, stackPages } from './gridArt.ts';
+import { ASCII, PAGE, photoLinework, fetchDataUrl, groundPage, inkPage, plainGroundPage, loadImage, loadOwnerFont, marksPage, ownerPage, stackPages } from './gridArt.ts';
 
 declare const __ENGINE_REV__: string;
 
@@ -35,6 +35,19 @@ export interface Ticket {
   /** the engine's layers the artwork is made of */
   composition: unknown[];
   updated_at: string;
+  /** the light it's shown in (CARD_LIGHTS), if one was picked */
+  lighting?: string | null;
+  /** the stickers on it, where they were put */
+  stickers?: TicketSticker[] | null;
+}
+
+/** a sticker on a ticket: which one (stickers.ts), where on the card (0..1, v up), how big (of the card's width) and turned how far */
+export interface TicketSticker {
+  id: string;
+  u: number;
+  v: number;
+  scale: number;
+  rotation: number;
 }
 
 /**
@@ -75,13 +88,32 @@ export interface TicketDraft {
   layers: number;
   /** its own design, layer by layer (engine is then ENGINE_DESIGN, seed the first layer's, layers how many) */
   design?: DesignLayer[];
+  /** a webcam photo (a data URL), etched as the design's Photo layer */
+  photo?: string;
+  /** the light it's shown in: one of CARD_LIGHTS */
+  lighting?: string;
 }
+
+/** a design layer that's the draft's photo rather than one of the engine's systems */
+export const PHOTO_LAYER = 'Photo';
+
+/** the lights a ticket can be shown in (the scene's lightings), each with a swatch of how it colours the metal */
+export const CARD_LIGHTS: { name: string; swatch: string }[] = [
+  { name: 'Field Green', swatch: 'linear-gradient(135deg, #b9f5d8, #45e09c)' },
+  { name: 'Field Supabase', swatch: 'linear-gradient(135deg, #3ecf8e, #1b6b8f)' },
+  { name: 'Green Neon', swatch: 'linear-gradient(135deg, #0b1a12, #6dff9e)' },
+  { name: 'Aurora', swatch: 'linear-gradient(135deg, #3ecf8e, #7a5cff)' },
+  { name: 'Sunset', swatch: 'linear-gradient(135deg, #ffb27a, #ff4f7a)' },
+  { name: 'Neon', swatch: 'linear-gradient(135deg, #ff48b0, #2fd6ff)' },
+  { name: 'Studio', swatch: 'linear-gradient(135deg, #f1f2f4, #9aa0a8)' },
+];
 
 /** a ticket drawn from a design made layer by layer */
 export const ENGINE_DESIGN = 'Design';
 
 /** a draft from a design: its engine, seed and layer count follow from it */
-export const designDraft = (username: string, design: DesignLayer[]): TicketDraft => ({
+export const designDraft = (username: string, design: DesignLayer[], keep?: Pick<TicketDraft, 'photo' | 'lighting'>): TicketDraft => ({
+  ...keep,
   username,
   engine: ENGINE_DESIGN,
   seed: design[0]?.seed ?? 1,
@@ -91,7 +123,7 @@ export const designDraft = (username: string, design: DesignLayer[]): TicketDraf
 
 /** how many of the latest tickets the stack is made of */
 /** a ticket's image, as stored: the page at half size */
-export const TICKET_SIZE = { w: 1000, h: 1500 };
+export const TICKET_SIZE = { w: PAGE.w / 2, h: PAGE.h / 2 };
 export const USERNAME_MAX = 24;
 
 /** a username as the table takes it: lowercase letters, digits and underscores */
@@ -103,12 +135,18 @@ export const CAN_MAKE_TICKETS = ENGINE_AVAILABLE && !!supabase;
 export const ticketImageUrl = (t: Pick<Ticket, 'image_path'>) =>
   `${URL_BASE}/storage/v1/object/public/tickets/${t.image_path}`;
 
-/** a new random design of two to four layers */
-export const randomDraft = (username: string): TicketDraft =>
-  designDraft(username, Array.from({ length: 2 + Math.floor(Math.random() * 3) }, randomDesignLayer));
+/** a ticket's design is three layers */
+export const DESIGN_LAYERS = 3;
+
+/** a new random design of three layers (keeping the photo and light, if there are any) */
+export const randomDraft = (username: string, keep?: Pick<TicketDraft, 'photo' | 'lighting'>): TicketDraft =>
+  designDraft(username, Array.from({ length: DESIGN_LAYERS }, randomDesignLayer), keep);
 
 /** what the stack needs of a ticket (not its layers, which can be large) */
-const TICKET_FIELDS = 'id, user_id, username, number, engine, seed, layers, engine_rev, image_path, updated_at';
+const BASE_FIELDS = 'id, user_id, username, number, engine, seed, layers, engine_rev, image_path, updated_at';
+/** with the ticket's light and stickers, once the project has them (until its migration's applied, without) */
+let TICKET_FIELDS = `${BASE_FIELDS}, lighting, stickers`;
+const missingColumn = (e: { code?: string } | null) => e?.code === '42703' || e?.code === 'PGRST204';
 
 /** How many tickets there are. Throws if that can't be fetched. */
 export async function ticketCount(): Promise<number> {
@@ -121,7 +159,11 @@ export async function ticketCount(): Promise<number> {
 /** Tickets from-th to to-th (inclusive) in number order: only what's about to be shown. Throws if they can't be fetched. */
 export async function ticketRange(from: number, to: number): Promise<Ticket[]> {
   if (!supabase) return [];
-  const { data, error } = await supabase.from('tickets').select(TICKET_FIELDS).order('number').range(from, to);
+  let { data, error } = await supabase.from('tickets').select(TICKET_FIELDS).order('number').range(from, to);
+  if (missingColumn(error) && TICKET_FIELDS !== BASE_FIELDS) {
+    TICKET_FIELDS = BASE_FIELDS;
+    ({ data, error } = await supabase.from('tickets').select(TICKET_FIELDS).order('number').range(from, to));
+  }
   if (error) throw new Error(`tickets ${from}–${to} couldn't be fetched: ${error.message}`);
   return data as unknown as Ticket[];
 }
@@ -165,6 +207,33 @@ let fieldUrl: Promise<string> | null = null;
 /** the last artwork drawn, so typing a username doesn't redraw the engine */
 let lastArt: { key: string; art: Promise<{ stages: string[]; singles: string[]; layers: unknown[] }> } | null = null;
 
+/**
+ * The artwork's stages and layers: the engine's, with the photo (if the
+ * design has a Photo layer) etched in its place among them.
+ */
+async function designStages(
+  d: TicketDraft,
+  box: { x: number; y: number; w: number; h: number },
+): Promise<{ stages: string[]; singles: string[]; layers: unknown[] }> {
+  const at = d.design?.findIndex((l) => l.system === PHOTO_LAYER) ?? -1;
+  if (at < 0 || !d.photo) {
+    const design = d.design?.filter((l) => l.system !== PHOTO_LAYER);
+    return engineStages(d.engine, d.seed, box, design?.length ?? d.layers, design?.length ? design : undefined);
+  }
+  const rest = d.design!.filter((_, i) => i !== at);
+  const [engine, photo] = await Promise.all([
+    rest.length ? engineStages(ENGINE_DESIGN, rest[0].seed, box, rest.length, rest) : Promise.resolve({ stages: [], singles: [], layers: [] }),
+    photoLinework(d.photo),
+  ]);
+  const singles = [...engine.singles];
+  singles.splice(at, 0, photo);
+  const layers = [...engine.layers];
+  layers.splice(at, 0, { gen: PHOTO_LAYER });
+  // each stage is the layers so far, one over another
+  const stages = singles.map((_, k) => singles.slice(0, k + 1).join('\n'));
+  return { stages, singles, layers };
+}
+
 const svgUrl = (svg: string) => `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
 
 /**
@@ -175,8 +244,8 @@ const svgUrl = (svg: string) => `data:image/svg+xml;charset=utf-8,${encodeURICom
  */
 export async function drawTicket(d: TicketDraft, number?: number): Promise<DrawnTicket> {
   const box = { x: ASCII.x0, y: ASCII.y0, w: ASCII.x1 - ASCII.x0, h: ASCII.y1 - ASCII.y0 };
-  const key = `${d.engine}|${d.seed}|${d.layers}|${JSON.stringify(d.design ?? null)}`;
-  if (lastArt?.key !== key) lastArt = { key, art: engineStages(d.engine, d.seed, box, d.layers, d.design) };
+  const key = `${d.engine}|${d.seed}|${d.layers}|${JSON.stringify(d.design ?? null)}|${d.photo?.length ?? 0}:${d.photo?.slice(-64) ?? ''}`;
+  if (lastArt?.key !== key) lastArt = { key, art: designStages(d, box) };
   const [{ stages, singles, layers }, field] = await Promise.all([
     lastArt.art,
     (fieldUrl ??= fetchDataUrl('/artwork/field.png')),
@@ -226,6 +295,27 @@ export async function drawTicket(d: TicketDraft, number?: number): Promise<Drawn
   };
 }
 
+/**
+ * A saved ticket's whole page as one image: plain metal, its stored
+ * linework, the page's marks and its owner. For a still of the card (the
+ * shot view); the linework's fetched as data, since an SVG drawn as an image
+ * can't load anything itself.
+ */
+export async function ticketPage(t: Pick<Ticket, 'username' | 'number' | 'image_path'>): Promise<HTMLImageElement> {
+  const [ink] = await Promise.all([fetchDataUrl(ticketImageUrl(t)), loadOwnerFont()]);
+  // plain metal, as the stack's cards are: the room gives it its colour
+  return loadImage(
+    svgUrl(stackPages([svgUrl(plainGroundPage(PLAIN_GROUND)), ink, svgUrl(marksPage()), svgUrl(ownerPage({ username: t.username, number: t.number }))])),
+  );
+}
+
+/** One ticket by its username, or null. */
+export async function ticketByUsername(username: string): Promise<Ticket | null> {
+  if (!supabase) return null;
+  const { data } = await supabase.from('tickets').select(TICKET_FIELDS).eq('username', username).maybeSingle();
+  return (data as unknown as Ticket | null) ?? null;
+}
+
 /** What a ticket keeps: its linework alone, on clear ground, as WebP (the page and labels are added when it's shown). */
 async function ticketBlob(drawn: DrawnTicket): Promise<Blob> {
   const canvas = document.createElement('canvas');
@@ -245,15 +335,15 @@ function saveError(err: unknown): Error {
 }
 
 /** Put the signed-in person's ticket in the stack (or replace theirs with a remix). */
-export async function saveTicket(d: TicketDraft, drawn: DrawnTicket): Promise<Ticket> {
+export async function saveTicket(d: TicketDraft, drawn: DrawnTicket, stickers: TicketSticker[] = []): Promise<Ticket> {
   try {
-    return await saveTicketOnce(d, drawn);
+    return await saveTicketOnce(d, drawn, stickers);
   } catch (err) {
     throw saveError(err);
   }
 }
 
-async function saveTicketOnce(d: TicketDraft, drawn: DrawnTicket): Promise<Ticket> {
+async function saveTicketOnce(d: TicketDraft, drawn: DrawnTicket, stickers: TicketSticker[]): Promise<Ticket> {
   const token = await accountToken();
   if (!token) throw new Error('Log in with Supabase to print your ticket.');
   const form = new FormData();
@@ -266,6 +356,8 @@ async function saveTicketOnce(d: TicketDraft, drawn: DrawnTicket): Promise<Ticke
       layers: d.layers,
       engine_rev: __ENGINE_REV__ || 'unknown',
       composition: drawn.composition,
+      lighting: d.lighting ?? null,
+      stickers,
     }),
   );
   form.set('image', await ticketBlob(drawn), 'ticket.webp');
@@ -321,4 +413,26 @@ export async function refreshSeededTickets(key: string) {
   return done;
 }
 
-if (import.meta.env.DEV) Object.assign(window, { __seedTickets: seedTickets, __refreshSeededTickets: refreshSeededTickets });
+/**
+ * Dev only: fill the stack with seeded tickets through the dev server's own
+ * route (it writes with the secret key from .env.local; never deployed).
+ * Each gets its own random artwork. Run from the console:
+ * `await __seedLocal(['ada', 'grace'])`.
+ */
+export async function seedLocal(usernames: string[], onEach?: (done: number, name: string) => void) {
+  const made: string[] = [];
+  for (const username of usernames) {
+    const draft = randomDraft(cleanUsername(username));
+    const drawn = await drawTicket(draft);
+    const form = new FormData();
+    form.set('ticket', JSON.stringify({ ...draft, design: undefined, engine_rev: __ENGINE_REV__ || 'unknown', composition: drawn.composition }));
+    form.set('image', await ticketBlob(drawn), 'ticket.webp');
+    const res = await fetch('/__dev/seed', { method: 'POST', body: form });
+    if (!res.ok) throw new Error(`${username}: ${res.status} ${await res.text()}`);
+    made.push(username);
+    onEach?.(made.length, username);
+  }
+  return made;
+}
+
+if (import.meta.env.DEV) Object.assign(window, { __seedTickets: seedTickets, __refreshSeededTickets: refreshSeededTickets, __seedLocal: seedLocal });

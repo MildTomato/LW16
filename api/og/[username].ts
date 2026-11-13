@@ -1,7 +1,7 @@
-// GET /api/og/<username>?v=<image version>: the ticket's share image, 1200x630 PNG.
+// GET /api/og/<username>?v=<image version>[&layout=centre|left|stacked|bleed][&theme=light|dark]: the ticket's share image, 1200x630 PNG.
 // The version in the URL changes on every remix, so a matching one is cached forever.
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import { renderCard } from '../_lib/card.js';
+import { cardLayout, cardTheme, renderCard } from '../_lib/card.js';
 import { fetchTicket, fetchTicketImage, imageVersion, parseUsername } from '../_lib/tickets.js';
 
 export default async function handler(req: IncomingMessage, res: ServerResponse) {
@@ -19,7 +19,7 @@ export default async function handler(req: IncomingMessage, res: ServerResponse)
   try {
     const ticket = await fetchTicket(username);
     if (!ticket) return send(404, 'no such ticket', 'public, max-age=0, s-maxage=60');
-    const png = await renderCard(ticket, await fetchTicketImage(ticket));
+    const png = await renderCard(ticket, await fetchTicketImage(ticket), cardLayout(url.searchParams.get('layout')), cardTheme(url.searchParams.get('theme')));
     // an old ?v= gets today's image, but only briefly, so it can't pin the wrong one
     const current = url.searchParams.get('v') === imageVersion(ticket);
     res.statusCode = 200;

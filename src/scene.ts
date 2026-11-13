@@ -14,12 +14,13 @@ import { MacroDofPass } from './dofPass.ts';
 import { BAKED_POSE } from './bakedPose.ts';
 import { engineLinework } from './engineArt.ts';
 import { LASER_COLS, LASER_ROWS, headAt, planPass, type LaserPlan } from './laser.ts';
-import { gridSvg, growthSvg, barsSvg, asciiSvg, asciiGrid, ditherSvg, ditherGrid, pageWith, groundPage, marksPage, ownerPage, loadOwnerFont, ASCII, sampleLuminance, loadImage, fetchDataUrl } from './gridArt.ts';
+import { gridSvg, growthSvg, barsSvg, asciiSvg, asciiGrid, ditherSvg, ditherGrid, pageWith, groundPage, marksPage, ownerPage, loadOwnerFont, ASCII, PAGE, sampleLuminance, loadImage, fetchDataUrl } from './gridArt.ts';
 import { FaceTracker } from './faceTracker.ts';
 import { MetalCard } from './card.ts';
 import { Titles } from './titles.ts';
 // a card's ground when the room colours it: bright, plain metal
 import { PLAIN_GROUND } from './tickets.ts';
+import { stickerIdOf, stickerUrlOf } from './stickers.ts';
 import { ROLODEX_SPINE, WHEEL_SPINE, TILE_COUNT, TILE_RADIUS, tileTicket, type StackParams } from './cardStack.ts';
 import {
   nextShot, shotCamera, shotLight, shotPose, nextClothShot, rolodexShot, moveProgress, shotProgress, type Shot, type ClothShot,
@@ -161,6 +162,15 @@ const camQ = new THREE.Quaternion(), camQe = new THREE.Quaternion(), camU0 = new
 const IDENTITY_Q = new THREE.Quaternion();
 /** how much of the view's height a shown card fills */
 const PLATE_FILL = 0.66;
+/** an opened ticket, on its side below the formation: how much of the view's height it fills, and how far below the middle it sits */
+/** the wheel runs the Helix along at this much of a drag's rate */
+const HELIX_WHEEL = 0.6;
+const OPEN_FILL = 0.42;
+const OPEN_DROP = 0.16;
+/** and the formation rises by this much of the view's height, up out of its way */
+const OPEN_LIFT = 0.24;
+/** a quarter turn about the view: the card's right edge down, so its owner reads left to right */
+const ON_ITS_SIDE = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), -Math.PI / 2);
 const asideDir = new THREE.Vector3();
 /** how far the Tiles wall fades out behind a pulled-out tile */
 const TILE_VEIL = 0.7;
@@ -172,6 +182,8 @@ const VEIL_TIME = 0.4;
 const TILES_LIGHT = 1.45;
 /** how far (radians) the Tiles wall's light is turned round from the Helix's */
 const TILES_LIGHT_TURN = THREE.MathUtils.degToRad(-134);
+/** the wall stood round the camera: this much further back than the drum's own viewer */
+const WALL_BACK = 1.2;
 /** and how far (radians) its light is tipped up toward the top of the wall */
 const TILES_LIGHT_TIP = 0.55;
 /** Tiles is seen from inside its drum, looking at the wall ahead */
@@ -199,17 +211,29 @@ const TONE_MAPPINGS: Record<string, THREE.ToneMapping> = {
 };
 
 /** the Flower artwork's photos: each a single stem on solid black */
-/** room for this many tickets in the stack, each at this size (a 2:3 page) */
 /**
  * The plate art pool: one for both views, so switching between them reloads
  * nothing — the Helix's few tickets and the wall's on-screen ones fit — and
  * a pulled-out card, filling the view, gets its own at full size (FOCUS_ART)
  */
-const POOL = { count: 64, w: 480, h: 720 };
+const POOL = { count: 64, w: 480, h: Math.round((480 * PAGE.h) / PAGE.w) };
 const POOLS = { Helix: POOL, Tiles: POOL };
-const FOCUS_ART = { w: 1000, h: 1500 };
+/**
+ * An image drawn to fill w×h, unless it's a different shape: a ticket stored
+ * on an older page (2:3, before tickets went square) is fitted whole and
+ * centred rather than stretched.
+ */
+function drawFitted(ctx: CanvasRenderingContext2D, img: CanvasImageSource, w: number, h: number) {
+  const iw = (img as { width: number }).width || w;
+  const ih = (img as { height: number }).height || h;
+  if (Math.abs(iw / ih - w / h) < 0.01) return ctx.drawImage(img, 0, 0, w, h);
+  const k = Math.min(w / iw, h / ih);
+  ctx.drawImage(img, (w - iw * k) / 2, (h - ih * k) / 2, iw * k, ih * k);
+}
+
+const FOCUS_ART = { w: 1000, h: Math.round((1000 * PAGE.h) / PAGE.w) };
 /** how far round the view (stack units) a wall card still counts as on screen: about a card */
-const TILE_VIEW_MARGIN = 1.6;
+const TILE_VIEW_MARGIN = 0.95;
 const viewFrustum = new THREE.Frustum();
 const viewMatrix = new THREE.Matrix4();
 const viewSphere = new THREE.Sphere();
@@ -238,7 +262,16 @@ const WHEEL_TICKETS = 16;
 /** how many cards each formation starts with when picked from the view switch; the panel's Count can change it after */
 export const SHAPE_TICKETS: Record<string, number> = { Rolodex: ROLODEX_TICKETS, Wheel: WHEEL_TICKETS, Helix: HELIX_TICKETS };
 /** a ticket for the stack: its image (its linework alone) and its owner's username */
-type TicketSource = { id: string; url: string; owner: string; number: number };
+type TicketSource = {
+  id: string;
+  url: string;
+  owner: string;
+  number: number;
+  /** its stickers, as saved */
+  stickers?: { id: string; u: number; v: number; scale: number; rotation: number }[] | null;
+};
+/** a sticker to draw on a ticket's plate: its image, where (0..1, v up), its width (of the card's) and its turn */
+type PlateSticker = { img: CanvasImageSource; u: number; v: number; scale: number; rotation: number };
 /** a slot of the plate art: which ticket's image it holds, whether that's in, and when it was last on a plate */
 type TicketSlot = { id: string | null; ready: boolean; used: number };
 /** a drawn ticket, as the laser cuts it: its stages, and its lettering (all of it, its marks, its owner, and over the artwork) */
@@ -551,6 +584,8 @@ export class HoloApp {
   private ticketMarksImg: Promise<HTMLImageElement> | null = null;
   /** a ticket is being made on the card; the laser's progress through cutting it (null: not cutting) */
   private ticketing = false;
+  /** the shot view: the card shows one saved ticket, and nothing else changes its face */
+  private stillFace = false;
   /** the stack is the Tiles sheet: dragged and scrolled, not orbited */
   private tilesView = false;
   /** the Rolodex is up: dragging spins it on its spine */
@@ -576,6 +611,10 @@ export class HoloApp {
   /** how much brighter the view is lit (Tiles is turned up), eased */
   private viewLight = 1;
   private tileDrag: { id: number; x: number; y: number; t: number; vx: number; vy: number } | null = null;
+  /** how far round from -z the wall was stood, facing the viewer (the lighting turns with it) */
+  private wallYaw = 0;
+  /** the stack's a Helix (and not being made into a ticket): dragged along, not orbited */
+  private helixView = false;
   /** the camera easing to a view: from, to, and how far (0..1) */
   private camMove: { from: [THREE.Vector3, THREE.Vector3, number]; to: [THREE.Vector3, THREE.Vector3, number]; k: number } | null = null;
   private etch: number | null = null;
@@ -889,8 +928,8 @@ export class HoloApp {
    * so dragging a slider doesn't queue up renders.
    */
   private updateGridArt(g: HoloParams['grid']) {
-    // a ticket in the making owns the card's face
-    if (!g || this.ticketing) return;
+    // a ticket in the making, or a still of one, owns the card's face
+    if (!g || this.ticketing || this.stillFace) return;
     const generated = g.pattern === 'Generated' || g.pattern === 'Growth' || g.pattern === 'Bars' || g.pattern === 'Flower' || g.pattern === 'Engine';
     const key = g.pattern === 'Generated'
       ? ['Generated', g.rows, g.depth, g.fill, g.endCircles, g.guides, g.seed].join('|')
@@ -929,6 +968,8 @@ export class HoloApp {
    */
   setTickets(total: number, fetch: (from: number, to: number) => Promise<TicketSource[]>) {
     this.ticketTotal = total;
+    this.dealtTotal = total;
+    this.dealt = [];
     this.fetchTicketRange = fetch;
     this.ticketAt.clear();
     this.ticketIndex.clear();
@@ -981,6 +1022,9 @@ export class HoloApp {
     this.onImagesChanged?.();
     // and the engraver lowered over it
     this.card.setGantry(true);
+    // the card held still, front-on, and the view fixed: stickers go where they're put
+    this.card.held = true;
+    this.card.faceFront();
     this.applyStack();
   }
 
@@ -1138,6 +1182,7 @@ export class HoloApp {
   endTicket() {
     if (!this.ticketing) return;
     this.ticketing = false;
+    this.card.held = false;
     this.card.setGantry(false);
     // a card flipped while it was being made goes back front-on: the stack's not left turned round
     this.card.faceFront();
@@ -1148,6 +1193,8 @@ export class HoloApp {
     for (const old of this.letteringTexs) old?.dispose();
     this.letteringTexs = [];
     this.etchCut = null;
+    // the stickers were the ticket's: they go with it (saved, or not)
+    this.clearStickers();
     this.refreshGridArt();
     this.applyStack();
   }
@@ -1164,7 +1211,12 @@ export class HoloApp {
     if (old && old.url === t.url && old.owner === t.owner && old.number === t.number) return;
     // a ticket not seen before is the newest: it joins the end
     if (known !== undefined) this.putTicket(known, t);
-    else this.putTicket(this.ticketTotal++, t);
+    else {
+      const at = this.ticketTotal++;
+      this.putTicket(at, t);
+      // on the Helix the cards glide along to open a gap in the middle, and it comes into it
+      if (this.params?.stack?.shape === 'Helix' && this.card.stacked && !this.tilesView) this.openGapFor(at);
+    }
     // a slot already holding it: load it afresh
     const slot = this.slotOf.get(t.id);
     if (slot !== undefined) {
@@ -1172,16 +1224,56 @@ export class HoloApp {
       this.plateTickets.forEach((id, p) => id === t.id && this.card.plateReady(p, false));
       this.loadTicket(t, slot);
     }
-    this.applyStack();
+    // only the cards are dealt again (re-applying the whole stack restarts the formation: it jerks);
+    // the wall's count follows the tickets, so it's set up afresh
+    if (this.tilesView) this.applyStack();
+    else this.assignPlates();
+  }
+
+  /**
+   * The Helix's deal: the ticket at each place round its ring (on its first
+   * lap; each lap after is a ring's worth further back). It's dealt from the
+   * tickets there were when they came; a newcomer is spliced in at the
+   * middle, the cards from there on gliding one along to make room, and
+   * the one pushed off the far end goes.
+   */
+  private dealtTotal = 0;
+  private dealt: number[] = [];
+
+  private dealHelix() {
+    const count = this.card.plateCount;
+    const n = Math.max(1, this.dealtTotal || this.ticketTotal);
+    this.dealt = Array.from({ length: count }, (_, p) => Math.max(0, n - count) + p);
+  }
+
+  /** ticket `at` (just arrived) goes into the Helix's middle: a gap opens for it and it comes into it */
+  private openGapFor(at: number) {
+    if (this.dealt.length !== this.card.plateCount) this.dealHelix();
+    const place = this.card.middlePlace();
+    this.dealt.splice(place, 0, at);
+    this.dealt.length = this.card.plateCount;
+    this.card.openGap(place);
   }
 
   /** the ticket plate i shows: the Helix the latest few, Tiles every one as it scrolls */
   private ticketForPlate(i: number) {
+    const shape = this.params?.stack?.shape;
+    // the Helix: dealt by place round its ring, each lap a ring's worth further back
+    if (shape === 'Helix' && !this.tilesView && this.ticketTotal) {
+      const count = this.card.plateCount;
+      if (this.dealt.length !== count) this.dealHelix();
+      const lap = this.card.helixLap(i);
+      const first = this.dealt[this.card.ringPlace(i)] ?? 0;
+      if (lap === 0) return this.ticketAtPlace(first);
+      const n = Math.max(1, this.dealtTotal || this.ticketTotal);
+      const k = ((first % n) - lap * count) % n;
+      return this.ticketAtPlace(k < 0 ? k + n : k);
+    }
     const n = this.ticketTotal;
     // the Helix shows the latest few; the wall starts at them too, so the
     // cards that fly from the one to the other keep their tickets on the way
     const latest = n - Math.min(n, HELIX_TICKETS);
-    if (this.tilesView) return this.ticketAtPlace((tileTicket(i, n, this.card.tilesScrollY, this.card.dims.h) + latest) % n);
+    if (this.tilesView) return this.ticketAtPlace((tileTicket(i, n, this.card.tilesScrollY) + latest) % n);
     // the formation shows the latest as many as it has cards, starting over when it has more cards than tickets
     const count = this.card.plateCount;
     // the Helix has no end: each time a card comes back round it's a whole
@@ -1203,7 +1295,12 @@ export class HoloApp {
     // ticket loaded: the drum's other cards, behind you or past the edges,
     // let theirs go
     const inView = this.tilesView ? this.platesInView() : null;
-    for (let i = 0; i < this.card.plateCount; i++) {
+    // left to right along the formation, so the artwork's fetched (and lands) in that order
+    const known = this.card.plateOrder.length === this.card.plateCount;
+    // the Helix assigns every frame: wait a frame for its order rather than fetch out of it
+    if (!known && this.params?.stack?.shape === 'Helix' && this.card.stacked) return;
+    const order = known ? this.card.plateOrder : Array.from({ length: this.card.plateCount }, (_, i) => i);
+    for (const i of order) {
       if (inView && !inView[i]) {
         this.dropPlate(i);
         continue;
@@ -1316,14 +1413,15 @@ export class HoloApp {
   private async loadTicket(t: TicketSource, slot: number) {
     const pool = this.pool;
     try {
-      const { ground, marks, owner, img } = await this.ticketLayers(t);
+      const layers = await this.ticketLayers(t);
+      const { marks, img } = layers;
       // the slot's gone to another ticket meanwhile (or this one's image has changed)
       const at = this.ticketIndex.get(t.id);
       const current = at !== undefined ? this.ticketAt.get(at) : undefined;
       if (this.pool !== pool || this.slots[slot]?.id !== t.id || current?.url !== t.url || this.disposed) return img.close();
       const art = (this.ticketArt ??= this.newTicketArt());
       const { w, h } = POOLS[this.pool!];
-      const px = this.composeTicket({ ground, marks, owner, img }, w, h);
+      const px = this.composeTicket(layers, w, h);
       img.close();
       if (!this.plateMarks) {
         this.plateMarks = new THREE.Texture(marks);
@@ -1360,7 +1458,11 @@ export class HoloApp {
    * under the lettering), and the owner — cut right through — in the alpha.
    * The page's marks are the same on every ticket: the card has them once.
    */
-  private composeTicket(l: { ground: CanvasImageSource; marks: CanvasImageSource; owner: CanvasImageSource; img: CanvasImageSource }, w: number, h: number) {
+  private composeTicket(
+    l: { ground: CanvasImageSource; marks: CanvasImageSource; owner: CanvasImageSource; img: CanvasImageSource; stickers?: PlateSticker[] },
+    w: number,
+    h: number,
+  ) {
     const size = `${w}x${h}`;
     if (this.composeSize !== size) {
       this.composeSize = size;
@@ -1373,7 +1475,7 @@ export class HoloApp {
     }
     mctx.drawImage(l.marks, 0, 0, w, h);
     octx.drawImage(l.owner, 0, 0, w, h);
-    ictx.drawImage(l.img, 0, 0, w, h);
+    drawFitted(ictx, l.img, w, h);
     ictx.setTransform(1, 0, 0, 1, 0, 0);
     ictx.globalCompositeOperation = 'destination-out';
     ictx.drawImage(mctx.canvas, 0, 0);
@@ -1388,6 +1490,22 @@ export class HoloApp {
     }
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.drawImage(ictx.canvas, 0, 0);
+    // the stickers, over everything: drawn the right way up on the marks canvas (free now), then laid on upside down like the rest
+    if (l.stickers?.length) {
+      mctx.setTransform(1, 0, 0, 1, 0, 0);
+      mctx.clearRect(0, 0, w, h);
+      for (const s of l.stickers) {
+        const sw = s.scale * w;
+        mctx.save();
+        mctx.translate(s.u * w, (1 - s.v) * h);
+        mctx.rotate((s.rotation * Math.PI) / 180);
+        mctx.drawImage(s.img, -sw / 2, -sw / 2, sw, sw);
+        mctx.restore();
+      }
+      ctx.setTransform(1, 0, 0, -1, 0, h);
+      ctx.drawImage(mctx.canvas, 0, 0);
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+    }
     const px = ctx.getImageData(0, 0, w, h).data;
     const ownerPx = octx.getImageData(0, 0, w, h).data;
     for (let k = 3; k < px.length; k += 4) px[k] = 255 - ownerPx[k];
@@ -1404,7 +1522,13 @@ export class HoloApp {
         if (!res.ok) throw new Error(`${res.status}`);
         return createImageBitmap(await res.blob());
       }),
-    ]).then(([ground, marks, owner, img]) => ({ ground, marks, owner, img }));
+      Promise.all(
+        (t.stickers ?? []).flatMap((s) => {
+          const url = stickerUrlOf(s.id);
+          return url ? [loadImage(url).then((img): PlateSticker => ({ img, u: s.u, v: s.v, scale: s.scale, rotation: s.rotation }))] : [];
+        }),
+      ),
+    ]).then(([ground, marks, owner, img, stickers]) => ({ ground, marks, owner, img, stickers }));
   }
 
   /**
@@ -1462,6 +1586,10 @@ export class HoloApp {
     if (!p?.stack) return;
     // Tiles is an endless sheet: more plates than tickets, the tickets repeating
     const tiles = p.stack.shape === 'Tiles';
+    // leaving the wall: the cards off screen on it come back without crossing the view
+    const toWall = tiles && !this.ticketing && p.cards === 'Stack';
+    if (this.tilesView && !toWall) this.card.setOffstage(this.platesInView().map((on) => !on));
+    else this.card.setOffstage(null);
     this.card.setStack({
       ...p.stack,
       cards: this.ticketing ? 'One' : p.cards,
@@ -1469,16 +1597,27 @@ export class HoloApp {
       count: tiles && this.ticketTotal ? TILE_COUNT : p.stack.count,
     });
     const tilesView = tiles && !this.ticketing && p.cards === 'Stack';
-    // into (or out of) Tiles, or making a ticket, the camera eases round to suit
+    // making a ticket, the camera eases round to it (and back after); into or out of Tiles it
+    // stays put: the wall's built round it, the lighting turned to match
     const view = this.ticketing ? 'Front' : tilesView ? 'Tiles' : 'Helix';
-    if (view !== this.view) this.frameView(view);
+    if (view !== this.view) {
+      const fromFront = this.view === 'Front';
+      if (view === 'Front' || (fromFront && view === 'Helix')) this.frameView(view);
+      if (view === 'Tiles') {
+        // back from making a ticket, the camera goes back to the Helix's view and the wall's built there
+        if (fromFront) this.frameView('Helix');
+        this.standWall();
+      }
+    }
     this.view = view;
     const viewChanged = tilesView !== this.tilesView;
     this.tilesView = tilesView;
     // the Rolodex and the wall are dragged themselves, not orbited round
     // the Wheel spins on its spine the same way
     this.rolodexView = (p.stack.shape === 'Rolodex' || p.stack.shape === 'Wheel') && !this.ticketing && p.cards === 'Stack';
-    this.controls.enabled = !tilesView && !this.rolodexView && !this.heroMode;
+    // the Helix is pulled along by hand, not orbited round
+    this.helixView = p.stack.shape === 'Helix' && !this.ticketing && p.cards === 'Stack';
+    this.controls.enabled = !tilesView && !this.rolodexView && !this.heroMode && !this.ticketing && !this.helixView;
     // the wall is shaded as one smooth curve: light sweeps across it in one band
     this.card.setTileCurve(tilesView);
     if (viewChanged) this.useLighting();
@@ -1668,6 +1807,40 @@ export class HoloApp {
     const item = this.surface.addDecal(img);
     this.onDecalSelect?.(item.scale, item.rotation);
     this.onImagesChanged?.();
+  }
+
+  /** The view as a PNG data URL, drawn now (the shot view's still). */
+  capturePng(): string {
+    this.composer.render();
+    return this.renderer.domElement.toDataURL('image/png');
+  }
+
+  /** The stickers on the card now, as a ticket keeps them (only the sheet's own: a photo decal isn't one). */
+  ticketStickers(): { id: string; u: number; v: number; scale: number; rotation: number }[] {
+    return this.surface.decals.flatMap((d) => {
+      const id = d.sticker ? stickerIdOf(d.img.src) : null;
+      return id ? [{ id, u: +d.u.toFixed(4), v: +d.v.toFixed(4), scale: +d.scale.toFixed(4), rotation: Math.round(d.rotation) }] : [];
+    });
+  }
+
+  /** Put a saved ticket's stickers back on the card (remixing it), replacing any there. */
+  async placeStickers(list: { id: string; u: number; v: number; scale: number; rotation: number }[]) {
+    for (const d of [...this.surface.decals]) if (d.sticker) this.surface.remove(d);
+    for (const s of list) {
+      const url = stickerUrlOf(s.id);
+      if (!url) continue;
+      const img = await loadImage(url);
+      this.surface.addSticker(img, s.u, s.v, s.scale, s.rotation);
+    }
+    this.onImagesChanged?.();
+  }
+
+  /** Show one saved ticket's page on the card, for good (the shot view). */
+  showStill(img: HTMLImageElement) {
+    this.stillFace = true;
+    // a still can come right up to the metal: macro shots of the grooves
+    this.controls.minDistance = 0.1;
+    this.setClothImage(img);
   }
 
   setClothImage(img: HTMLImageElement) {
@@ -1915,7 +2088,7 @@ export class HoloApp {
       ? Array.from({ length: n }, (_, i) => i).filter((i) => {
           if (this.card.plateShown(i) < 1) return false;
           this.card.platePoint(i, 0, 0, point, normal);
-          return Math.abs(point.y - this.controls.target.y) < TILE_CINE_ROWS * this.card.dims.h * 0.42 * 1.12;
+          return Math.abs(point.y - this.controls.target.y) < TILE_CINE_ROWS * this.card.dims.w * 0.42 * 1.12;
         })
       : null;
     let fallback: { shot: ClothShot; plate: { i: number; u: number; v: number; start: THREE.Vector3 } } | null = null;
@@ -2070,8 +2243,16 @@ export class HoloApp {
     return this.params?.drag === 'Move camera' || this.tilesView;
   }
 
+  /**
+   * An opened ticket always comes to the view now, the camera staying put:
+   * the Helix stays up top, and the ticket sits below it, on its side.
+   */
+  private get plateComesToView() {
+    return true;
+  }
+
   private focusPlate(plate: number | null) {
-    if (plate !== null && this.card.focusedPlate === null && this.plateCam.k === 0 && !this.cardComesToView) {
+    if (plate !== null && this.card.focusedPlate === null && this.plateCam.k === 0 && !this.plateComesToView) {
       this.plateCam.rest = {
         position: this.camera.position.clone(),
         target: this.controls.target.clone(),
@@ -2094,12 +2275,14 @@ export class HoloApp {
     const focused = this.card.focusedPlate !== null;
     // anything that ends the stack, or the reel taking the camera, sends it back
     if (focused && (!this.cardMode || !this.card.stacked || this.cine)) this.card.focusPlate(null);
-    // Move camera: the plate comes to the view — centred, square to it,
-    // filling most of the height — and follows it if you orbit
-    if (this.cardComesToView && !c.rest) {
+    // the plate comes to the view, the camera staying put: on its side
+    // (landscape, so its owner reads), in the lower part of the view with
+    // the formation still up above it; it follows if you orbit
+    if (this.plateComesToView && !c.rest) {
       const { w, h } = this.card.dims;
       const half = Math.tan(THREE.MathUtils.degToRad(this.camera.fov) / 2);
-      const fill = Math.max(h / 2, w / 2 / this.camera.aspect) / half / PLATE_FILL;
+      // on its side the card's width is its height on screen: it fills OPEN_FILL of the view's height (and fits across)
+      const fill = Math.max(w / 2 / OPEN_FILL, h / 2 / (this.camera.aspect * 0.9)) / half;
       const dir = new THREE.Vector3();
       this.camera.getWorldDirection(dir);
       // in front of the whole formation, so nothing passes over it: if it
@@ -2109,9 +2292,30 @@ export class HoloApp {
       const reach = this.card.formationBounds(centre);
       const clear = centre.sub(this.camera.position).dot(dir) - reach - 0.15;
       const dist = THREE.MathUtils.clamp(clear, 0.4, fill);
-      this.card.presentPlate(this.camera.position.clone().addScaledVector(dir, dist), this.camera.quaternion, dist / fill);
+      // below the middle of the view by OPEN_DROP of its height, and straight under the formation
+      const up = new THREE.Vector3(0, 1, 0).applyQuaternion(this.camera.quaternion);
+      const right = new THREE.Vector3(1, 0, 0).applyQuaternion(this.camera.quaternion);
+      const mid = new THREE.Vector3();
+      this.card.formationBounds(mid);
+      const midCam = mid.applyMatrix4(this.camera.matrixWorldInverse);
+      const across = midCam.z < -0.01 ? (midCam.x * dist) / -midCam.z : 0;
+      const at = this.camera.position
+        .clone()
+        .addScaledVector(dir, dist)
+        .addScaledVector(up, -OPEN_DROP * 2 * dist * half)
+        .addScaledVector(right, across);
+      const sideways = this.camera.quaternion.clone().multiply(ON_ITS_SIDE);
+      this.card.presentPlate(at, sideways, dist / fill);
     } else {
       this.card.presentPlate(null);
+    }
+    // an opened ticket sits below: the formation rises into the top of the view to make room
+    {
+      const half = Math.tan(THREE.MathUtils.degToRad(this.camera.fov) / 2);
+      const mid = new THREE.Vector3();
+      this.card.formationBounds(mid);
+      const depth = Math.max(0.5, -mid.applyMatrix4(this.camera.matrixWorldInverse).z);
+      this.card.liftGoal = focused && this.plateComesToView ? OPEN_LIFT * 2 * depth * half : 0;
     }
     const goal = this.card.focusedPlate !== null ? 1 : 0;
     // at rest there is nothing to do; held on a plate, keep following it as it floats
@@ -2123,7 +2327,8 @@ export class HoloApp {
     this.card.plateSpot(spot, normal, up);
     const { w, h } = this.card.dims;
     const half = Math.tan(THREE.MathUtils.degToRad(this.camera.fov) / 2);
-    const dist = Math.max(h / 2, w / 2 / this.camera.aspect) / half / PLATE_FILL;
+    // the card's on its side (landscape): its width is the view's height, its height the view's width
+    const dist = Math.max(w / 2, h / 2 / this.camera.aspect) / half / PLATE_FILL;
     const at = spot.clone().addScaledVector(normal, dist);
     this.camera.position.copy(c.rest.position).lerp(at, k);
     this.controls.target.copy(c.rest.target).lerp(spot, k);
@@ -2217,7 +2422,8 @@ export class HoloApp {
     this.perfProfile = profile;
     const dpr = window.devicePixelRatio;
     this.currentPR = profile === 'Low' ? 1 : profile === 'Medium' ? Math.min(dpr, 1.5) : Math.min(dpr, 2);
-    const samples = profile === 'Low' ? 0 : profile === 'Medium' ? 4 : 8;
+    // Low still smooths edges a little: with none, the cards' thin edges stair-step
+    const samples = profile === 'Low' ? 2 : profile === 'Medium' ? 4 : 8;
     const segs = profile === 'Low' ? 28 : profile === 'Medium' ? 36 : 48;
     const w = this.host.clientWidth || window.innerWidth;
     const h = this.host.clientHeight || window.innerHeight;
@@ -2406,7 +2612,8 @@ export class HoloApp {
   }
 
   endStickerDrag() {
-    this.controls.enabled = true;
+    // making a ticket the view stays fixed
+    this.controls.enabled = !this.ticketing;
   }
 
   /** One-shot: next click on the cloth becomes the DOF focal point. */
@@ -2532,8 +2739,8 @@ export class HoloApp {
       const plate = this.card.plateAt(this.raycastCard());
       this.plateClick = { id: e.pointerId, x: e.clientX, y: e.clientY, plate };
       if (this.card.focusedPlate !== null) return; // the camera is on it: no spinning or orbiting
-      // Tiles: the sheet is dragged; the Rolodex is spun
-      if (this.tilesView || this.rolodexView || this.heroMode) {
+      // Tiles: the sheet is dragged; the Rolodex is spun; the Helix is pulled along (and the next tickets come in)
+      if (this.tilesView || this.rolodexView || this.heroMode || this.helixView) {
         this.tileDrag = { id: e.pointerId, x: e.clientX, y: e.clientY, t: performance.now(), vx: 0, vy: 0 };
         this.card.holdTiles(true);
         this.renderer.domElement.setPointerCapture(e.pointerId);
@@ -2542,7 +2749,7 @@ export class HoloApp {
     }
     const hit = this.raycastCloth();
     if (!hit) {
-      if (this.cardMode) this.startCardSpin(e); // back or edge of the card
+      if (this.cardMode && !this.ticketing) this.startCardSpin(e); // back or edge of the card
       return;
     }
 
@@ -2556,6 +2763,8 @@ export class HoloApp {
       this.onImagesChanged?.();
       return;
     }
+    // making a ticket, a press on the card only ever picks up a sticker: it never spins
+    if (this.ticketing) return;
 
     if (this.cardMode) {
       this.startCardSpin(e);
@@ -2599,10 +2808,13 @@ export class HoloApp {
       const dt = Math.max(1, now - drag.t) / 1000;
       // the wall moves with the pointer; the Rolodex turns, by an angle per pixel
       const u = this.tilesView ? this.tileUnitsPerPx() : ROLODEX_SPIN_PER_PX;
-      // the hero's helix lies on its side: it rolls with the pointer, up and down or across
+      // the hero's helix lies on its side: it rolls with the pointer, up and down or across;
+      // the site's Helix is pulled along with it, across on its side or up and down standing
       const dx = this.heroMode && !this.tilesView
         ? (e.clientY - drag.y + (e.clientX - drag.x) * 0.5) * u
-        : (e.clientX - drag.x) * u;
+        : this.helixView && this.params?.stack?.axis !== 'Sideways'
+          ? -(e.clientY - drag.y) * u
+          : (e.clientX - drag.x) * u;
       const dy = this.tilesView ? (e.clientY - drag.y) * u : 0;
       this.card.scrollTiles(dx, dy);
       // the speed it's let go at, smoothed over the last few moves
@@ -2728,6 +2940,13 @@ export class HoloApp {
       this.card.scrollTiles(-e.deltaX * u, -e.deltaY * u);
       return;
     }
+    // the Helix: the wheel (or trackpad) runs it along, through the tickets (the hero's own wheel scrolls its page)
+    if (this.helixView && !this.heroMode && this.card.focusedPlate === null) {
+      e.preventDefault();
+      const px = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? window.innerHeight : 1;
+      this.card.scrollTiles(-(e.deltaX + e.deltaY) * px * ROLODEX_SPIN_PER_PX * HELIX_WHEEL, 0);
+      return;
+    }
     if (!this.editMode) return;
     const sel = this.surface.selected;
     if (!sel) return;
@@ -2773,6 +2992,19 @@ export class HoloApp {
    * Ease the camera to a view: the stack from low at three-quarters, Tiles
    * from inside its drum, Front square on to the card (making a ticket).
    */
+  /** Stand the wall round the camera where it is (or where it's headed), facing its way; the lighting turns with it */
+  private standWall() {
+    const eye = this.camMove ? this.camMove.to[0].clone() : this.camera.position.clone();
+    const target = this.camMove ? this.camMove.to[1].clone() : this.controls.target.clone();
+    const look = target.sub(eye);
+    this.wallYaw = Math.atan2(-look.x, -look.z);
+    // tipped to the camera's look, so the wall's seen square on, not from above
+    const pitch = Math.atan2(look.y, Math.hypot(look.x, look.z));
+    // and stood back a little further than the drum's own viewer stands
+    const viewer = new THREE.Vector3(...TILES_VIEW.camera).add(new THREE.Vector3(0, 0, WALL_BACK));
+    this.card.standWall(eye, this.wallYaw, pitch, viewer);
+  }
+
   frameView(view: string) {
     const tiles = view === 'Tiles';
     const to = tiles ? TILES_VIEW : DEFAULT_VIEW;
@@ -2891,6 +3123,7 @@ export class HoloApp {
 
     if (this.cine) this.runCinematic();
     if (this.cardMode) this.card.update(dt, this.elapsed);
+
     // the titles stand either side of the stack, out of the way of a ticket, the wall or a card being shown
     this.titleInk.set(this.background.getHSL({ h: 0, s: 0, l: 0 }).l < 0.5 ? '#e8e6e1' : '#1a1a1a');
     this.card.setOutlineInk(this.titleInk, this.background);
@@ -2994,9 +3227,10 @@ export class HoloApp {
     }
 
     // hover cursor feedback (skip while dragging/picking/panning, with the
-    // pointer off the canvas or the window out of focus; off on Low)
+    // pointer off the canvas or the window out of focus). On every profile:
+    // a card popping out as you point at it is part of the stack, and the test is cheap
     if (!this.grabbing && !this.draggingDecal && !this.pickingFocus && !this.spaceHeld &&
-        this.pointerOver && this.focused && this.perfProfile !== 'Low') {
+        this.pointerOver && this.focused) {
       const hit = this.cardMode ? this.raycastCard() : this.raycastCloth();
       // a plate of the stack under the pointer pops out a little, and can be clicked
       // (the pulled-out plate is already as far out as it goes)
@@ -3049,7 +3283,8 @@ export class HoloApp {
       this.scene.environmentRotation.x = tip;
       this.lightRig.rotation.x = tip;
       // and turned round for the wall: the angle the Light Angle slider sets, plus the wall's own
-      const turn = THREE.MathUtils.degToRad(this.params.render.lightAngle ?? 0) + k * TILES_LIGHT_TURN;
+      // (and turned with the wall, which stands wherever the viewer was looking)
+      const turn = THREE.MathUtils.degToRad(this.params.render.lightAngle ?? 0) + k * (TILES_LIGHT_TURN + this.wallYaw);
       this.scene.environmentRotation.y = turn;
       this.lightRig.rotation.y = turn;
 

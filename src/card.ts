@@ -2,7 +2,7 @@ import * as THREE from 'three';
 import { Line2 } from 'three/examples/jsm/lines/Line2.js';
 import { LineGeometry } from 'three/examples/jsm/lines/LineGeometry.js';
 import { LineMaterial } from 'three/examples/jsm/lines/LineMaterial.js';
-import { MAX_PLATES, StackAnimator, helixFade, helixLap, type StackParams } from './cardStack.ts';
+import { MAX_PLATES, StackAnimator, helixFade, helixLap, helixSlot, type StackParams } from './cardStack.ts';
 import { Monitor } from './monitor.ts';
 
 /** thin, like a die-cut metal ticket */
@@ -490,7 +490,55 @@ export class MetalCard {
     this.group.updateWorldMatrix(true, false);
     position.copy(this.stack.front).applyMatrix4(this.group.matrixWorld);
     normal.set(0, 0, 1).transformDirection(this.group.matrixWorld);
-    up.set(0, 1, 0).transformDirection(this.group.matrixWorld);
+    // on its side: the card's left edge up, so the owner (lettered up its right edge) reads left to right along the bottom
+    up.set(-1, 0, 0).transformDirection(this.group.matrixWorld);
+  }
+
+  /**
+   * Stand the wall round a viewer at `eye` (world space) looking `yaw` round
+   * from -z: its middle where the viewer would be inside it, turned to face
+   * their way. The wall's as it was built for a viewer at `viewer` (its own
+   * space) looking down -z.
+   */
+  standWall(eye: THREE.Vector3, yaw: number, pitch: number, viewer: THREE.Vector3) {
+    this.group.updateWorldMatrix(true, false);
+    // turned to the viewer's way, and tipped to their look (up or down), so it's seen square on
+    const world = new THREE.Matrix4()
+      .makeTranslation(eye.x, eye.y, eye.z)
+      .multiply(new THREE.Matrix4().makeRotationY(yaw))
+      .multiply(new THREE.Matrix4().makeRotationX(pitch))
+      .multiply(new THREE.Matrix4().makeTranslation(-viewer.x, -viewer.y, -viewer.z));
+    this.stack.wallFrame.copy(this.group.matrixWorld).invert().multiply(world);
+  }
+
+  /** plates whose place on the wall is off screen: they don't fly across the view to it (or from it) */
+  setOffstage(mask: readonly boolean[] | null) {
+    this.stack.setOffstage(mask);
+  }
+
+  /** the plates in order along the formation: left to right along the Helix */
+  get plateOrder(): readonly number[] {
+    return this.stack.plateOrder;
+  }
+
+  /** where Helix plate i is along it now (0 at one end, the plate count at the other) */
+  helixSlot(i: number) {
+    return helixSlot(this.stack.pos(i), this.stackParams.count, this.stackParams.twist, this.stack.flowPhase, this.stack.scrollX);
+  }
+
+  /** plate i's place in the Helix's ring (a whole number), as its ticket is dealt by */
+  ringPlace(i: number) {
+    return this.stack.ringPlace(i);
+  }
+
+  /** the Helix's ring place showing nearest its middle */
+  middlePlace() {
+    return this.stack.middlePlace(this.stackParams.count, this.stackParams.twist);
+  }
+
+  /** open a gap at ring place `at` for a newcomer: the cards from there on glide one along; returns the plate that comes into the gap */
+  openGap(at: number) {
+    return this.stack.openGap(at, this.stackParams.count);
   }
 
   /** how many plates the stack is drawing */
@@ -620,7 +668,14 @@ export class MetalCard {
     const a = this.plateFade.array as Float32Array;
     let changed = false;
     for (let i = 0; i < n; i++) {
-      const k = helix ? helixFade(i, n, this.stackParams.twist, this.stack.flowPhase, this.stack.scrollX) : 1;
+      // the Helix fades at its ends; a tile on the wall fades in as it comes forward
+      const tiles = this.stackParams.shape === 'Tiles' && this.stack.shapeNow === 'Tiles';
+      const shown = this.stack.plateShown(i);
+      const k = helix
+        ? helixFade(this.stack.pos(i), n, this.stackParams.twist, this.stack.flowPhase, this.stack.scrollX)
+        : tiles
+          ? shown * shown * (3 - 2 * shown)
+          : 1;
       if (Math.abs(a[i] - k) > 1e-4) {
         a[i] = k;
         changed = true;
@@ -886,6 +941,7 @@ export class MetalCard {
     this.stack.scrollBy(dx, dy);
   }
 
+
   /** Where the rest of the Helix steps aside to while a card's out: a world direction and distance. */
   setAside(world: THREE.Vector3) {
     const local = world.clone().applyQuaternion(this.group.getWorldQuaternion(new THREE.Quaternion()).invert());
@@ -895,7 +951,7 @@ export class MetalCard {
   /** how many times Helix plate i has gone round its endless spiral */
   helixLap(i: number) {
     const n = this.stackParams.count;
-    return helixLap(i, n, this.stackParams.twist, this.stack.flowPhase, this.stack.scrollX);
+    return helixLap(this.stack.ringPlace(i), n, this.stackParams.twist, this.stack.flowPhase, this.stack.scrollX);
   }
 
   /** Tiles: how far the wall's been scrolled */
@@ -1024,9 +1080,15 @@ export class MetalCard {
 
   /** settling to the front only, not whichever face is nearer: until the card's next dragged */
   private homeFront = false;
+  /** held still and front-on (making a ticket): no float, no spin, so stickers go where they're put */
+  held = false;
+  /** how far the formation rises (world units) to make room below it for an opened ticket; it eases there */
+  liftGoal = 0;
+  private lift = 0;
 
   /** Spin by a pointer drag of (dx, dy) pixels over dt seconds. */
   drag(dx: number, dy: number, dt: number) {
+    if (this.held) return;
     this.homeFront = false;
     this.rot.y += dx * SPIN_PER_PX;
     this.rot.x += dy * SPIN_PER_PX;
@@ -1235,7 +1297,8 @@ export class MetalCard {
     }
     this.group.rotation.set(this.rot.x, this.rot.y, 0);
     // a slow float, so it never looks parked
-    this.group.position.y = Math.sin(time * 0.9) * 0.04;
+    this.lift += (this.liftGoal - this.lift) * (1 - Math.exp(-4 * dt));
+    this.group.position.y = (this.held ? 0 : Math.sin(time * 0.9) * 0.04) + this.lift;
   }
 
   /** Begin the opening: each plate's outline drawn in, then the plates over them. */
@@ -1274,7 +1337,14 @@ export class MetalCard {
     const n = this.stack.collapsed ? 0 : only ? this.stackSlab.count : this.stackParams.count;
     for (let i = 0; i < Math.max(n, this.introLines.length); i++) {
       const drawn = i < n ? (only ? 1 : this.stack.outlineDrawn(i)) : 0;
-      const fade = drawn > 0 ? (only ? 1 : 1 - this.stack.plateShown(i)) : 0;
+      // as its plate comes down onto it an outline goes a lighter shade, and only as it lands does it go
+      const coming = only ? 0 : this.stack.plateShown(i);
+      // at the Helix's ends an outline fades as the cards do (only the Helix: the wall's plate fade is its tiles coming in)
+      const helixNow = this.stackParams.shape === 'Helix' && this.stack.shapeNow === 'Helix';
+      const endFade = helixNow && i < n ? (this.plateFade.array as Float32Array)[i] : 1;
+      // on the wall there's nothing behind an outline to hide, so it's just the line: no fill
+      const wall = this.stackParams.shape === 'Tiles' && this.stack.shapeNow === 'Tiles';
+      const fade = drawn > 0 ? (only ? 1 : 1 - THREE.MathUtils.smoothstep(coming, 0.88, 1)) : 0;
       let line = this.introLines[i];
       let fill = this.introFills[i];
       if (fade <= 0.001) {
@@ -1290,12 +1360,12 @@ export class MetalCard {
         fill.frustumCulled = false;
         this.group.add(fill);
       }
-      fill.visible = true;
+      fill.visible = !wall;
       if (only) this.stackSlab.getMatrixAt(i, fill.matrix);
       else fill.matrix.copy(this.stack.restMatrix(i) ?? fill.matrix);
       // a tint as the outline closes, easing back to the page before the plate comes
       fill.material.color.copy(this.outlineFill).lerp(this.outlinePaper, only ? 1 : this.stack.outlineSettled(i));
-      fill.material.opacity = fade * THREE.MathUtils.smoothstep(drawn, 0.6, 1);
+      fill.material.opacity = fade * endFade * THREE.MathUtils.smoothstep(drawn, 0.6, 1);
       if (!line) {
         // fat lines: WebGL draws plain lines one pixel wide whatever their width
         const geo = new LineGeometry().setPositions(this.outlinePositions());
@@ -1310,8 +1380,9 @@ export class MetalCard {
       // drawn as far as the opening has it, a segment at a time
       line.geometry.instanceCount = Math.ceil(drawn * (this.outlinePoints.length - 1));
       line.material.linewidth = this.stackParams.outlineWidth ?? 1;
-      line.material.color.copy(this.outlineInk);
-      line.material.opacity = fade;
+      line.material.color.copy(this.outlineInk).lerp(this.outlinePaper, 0.55 * THREE.MathUtils.smootherstep(coming, 0.15, 0.85));
+      // each outline fades in as it starts to draw, rather than appearing at full strength
+      line.material.opacity = fade * endFade * THREE.MathUtils.smoothstep(drawn, 0, 0.45);
     }
   }
 

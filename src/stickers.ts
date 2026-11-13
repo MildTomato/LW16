@@ -119,6 +119,46 @@ export const STICKERS: StickerDef[] = [
   },
 ];
 
+/**
+ * Logo stickers for the ticket maker: the tools people build with, each a
+ * simple drawing of the mark on its own die-cut disc.
+ */
+export const LOGO_STICKERS: StickerDef[] = [
+  {
+    id: 'supabase',
+    art: `<circle cx="100" cy="100" r="72" fill="#1c1c1c"/>
+      <g transform="translate(56.4 54.8) scale(0.8)">
+        <path d="M63.7 110.3c-2.9 3.6-8.7 1.6-8.8-3L54.1 40h45.4c8.2 0 12.8 9.5 7.7 15.9L63.7 110.3Z" fill="#249361"/>
+        <path d="M45.3 2.1c2.9-3.6 8.7-1.6 8.8 3l.4 67.3H9.8c-8.2 0-12.8-9.5-7.7-15.9L45.3 2.1Z" fill="#3ECF8E"/>
+      </g>`,
+  },
+  {
+    id: 'react',
+    art: `<circle cx="100" cy="100" r="72" fill="#20232a"/>
+      <g fill="none" stroke="#61dafb" stroke-width="6">
+        <ellipse cx="100" cy="100" rx="54" ry="20"/>
+        <ellipse cx="100" cy="100" rx="54" ry="20" transform="rotate(60 100 100)"/>
+        <ellipse cx="100" cy="100" rx="54" ry="20" transform="rotate(120 100 100)"/>
+      </g>
+      <circle cx="100" cy="100" r="10" fill="#61dafb"/>`,
+  },
+  {
+    id: 'vercel',
+    art: `<circle cx="100" cy="100" r="72" fill="#000"/>
+      <path d="M100 56 L148 140 H52 Z" fill="#fff"/>`,
+  },
+  {
+    id: 'nextjs',
+    art: `<circle cx="100" cy="100" r="72" fill="#000"/>
+      <path d="M70 136 V64 H83 L124 120 V64 H134 V136 H122 L80 79 V136 Z" fill="#fff"/>`,
+  },
+  {
+    id: 'typescript',
+    art: `<rect x="34" y="34" width="132" height="132" rx="16" fill="#3178c6"/>
+      <text x="158" y="156" text-anchor="end" font-family="Arial, Helvetica, sans-serif" font-weight="700" font-size="64" fill="#fff">TS</text>`,
+  },
+];
+
 const BORDER = 22;
 
 /** Full sticker SVG: shadowed white die-cut silhouette, then the art on top. */
@@ -137,8 +177,14 @@ export function stickerSvg(def: StickerDef): string {
 </svg>`;
 }
 
+const sheetOf = (defs: StickerDef[]) =>
+  defs.map((def) => ({ id: def.id, url: `data:image/svg+xml;charset=utf-8,${encodeURIComponent(stickerSvg(def))}` }));
+
 /** The sheet as data URLs, built once. */
-export const STICKER_SHEET = STICKERS.map((def) => ({
-  id: def.id,
-  url: `data:image/svg+xml;charset=utf-8,${encodeURIComponent(stickerSvg(def))}`,
-}));
+export const STICKER_SHEET = sheetOf(STICKERS);
+/** The ticket maker's sheet: the logos first, then the drawing-desk stickers. */
+export const TICKET_STICKERS = [...sheetOf(LOGO_STICKERS), ...STICKER_SHEET];
+/** a sticker's id from its image */
+export const stickerIdOf = (src: string) => TICKET_STICKERS.find((s) => s.url === src)?.id ?? null;
+/** a sticker's image from its id */
+export const stickerUrlOf = (id: string) => TICKET_STICKERS.find((s) => s.id === id)?.url ?? null;

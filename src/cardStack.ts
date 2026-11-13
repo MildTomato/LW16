@@ -1,4 +1,5 @@
 import * as THREE from 'three';
+import { PAGE } from './gridArt.ts';
 
 /**
  * Many copies of the card arranged as one sculpture: thin plates, each
@@ -11,14 +12,28 @@ export const STACK_SHAPES = ['Single', 'Twist', 'Wave', 'Fan', 'Bloom', 'Möbius
  * Tiles: a curved wall — the inside of a drum, this many columns round, of
  * this many plates (the tickets repeat to fill it). You stand at its middle.
  */
-export const TILE_COLS = 24;
+export const TILE_COLS = 12;
 export const TILE_COUNT = 120;
 const TILE_SCALE = 0.42;
+/**
+ * On the wall every card lies on its side (landscape), so its owner, lettered
+ * up its right edge, reads along the bottom: a column is a card's long side
+ * wide, a row its short side tall. The long side is 3; the short one follows
+ * from the ticket page's shape.
+ */
+const CARD_LONG = 3;
+const CARD_SHORT = 3 * Math.min(PAGE.w, PAGE.h) / Math.max(PAGE.w, PAGE.h);
 /** a column's width round the drum, and the drum's radius that fits them all */
-const TILE_CELL_W = 2 * TILE_SCALE * 1.14;
+const TILE_CELL_W = CARD_LONG * TILE_SCALE * 1.14;
+/** a row's height on the wall */
+const TILE_CELL_H = CARD_SHORT * TILE_SCALE * 1.12;
+/** a quarter turn in a card's own plane: its right edge down (landscape) */
+const ON_ITS_SIDE = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), -Math.PI / 2);
 export const TILE_RADIUS = (TILE_COLS * TILE_CELL_W) / (Math.PI * 2);
 
 const TILE_ROWS = Math.ceil(TILE_COUNT / TILE_COLS);
+/** the view's shape the wall's filled for: widescreen */
+const VIEW_ASPECT = 1.6;
 
 /**
  * Where on the wall plate i sits (unscrolled): the first plates nearest the
@@ -31,9 +46,12 @@ const TILE_SLOTS: { row: number; col: number }[] = (() => {
   const slots: { row: number; col: number; d: number }[] = [];
   for (let row = 0; row < TILE_ROWS; row++) {
     for (let col = 0; col < TILE_COLS; col++) {
-      // columns round the drum either side of straight ahead; rows are taller than columns are wide
+      // columns round the drum either side of straight ahead. Nearest first as they're seen:
+      // a column's as wide as a card is long, a row as tall as it is short, and the view's
+      // wider than it's tall, so the cards from another formation fill the wall in front, not round the back
       const across = col < TILE_COLS / 2 ? col : col - TILE_COLS;
-      slots.push({ row, col, d: Math.hypot(across, (row - mid) * 1.47) + (across < 0 ? 0.01 : 0) });
+      const dx = (across * TILE_CELL_W) / VIEW_ASPECT, dy = (row - mid) * TILE_CELL_H;
+      slots.push({ row, col, d: Math.hypot(dx, dy) + (across < 0 ? 0.001 : 0) });
     }
   }
   return slots.sort((a, b) => a.d - b.d).map(({ row, col }) => ({ row, col }));
@@ -45,8 +63,8 @@ const TILE_SLOTS: { row: number; col: number }[] = (() => {
  * keep their tickets moving onto the wall), and a whole wall's worth on for
  * each time its row has wrapped round — so scrolling goes through every ticket.
  */
-export function tileTicket(i: number, n: number, scrollY: number, h: number) {
-  const ch = h * TILE_SCALE * 1.12;
+export function tileTicket(i: number, n: number, scrollY: number) {
+  const ch = TILE_CELL_H;
   const { row } = TILE_SLOTS[i % TILE_COUNT];
   // how many times this plate's row has wrapped round (as laid out in plateMatrix)
   const wraps = Math.floor((row * ch + scrollY) / (TILE_ROWS * ch));
@@ -144,6 +162,8 @@ export function plateMatrix(
   out = new THREE.Matrix4(),
   /** Tiles: how far the wall's been turned and scrolled */
   scroll: TileState = NO_SCROLL,
+  /** Helix: where along it the plate sits (its place in the ring, gliding); the plate's own number if not given */
+  at = i,
 ) {
   // 0..1 along the form
   const f = n > 1 ? i / (n - 1) : 0;
@@ -192,7 +212,7 @@ export function plateMatrix(
       // and every column faces you a little differently, so the light varies
       // across the wall. Rows wrap round top to bottom out of view, a tile
       // shrinking away to nothing at the wrap.
-      const ch = h * TILE_SCALE * 1.12;
+      const ch = TILE_CELL_H;
       const rows = Math.ceil(n / TILE_COLS);
       const H = rows * ch;
       const wrap = (v: number, m: number) => ((v % m) + m) % m;
@@ -200,7 +220,7 @@ export function plateMatrix(
       const a = (slot.col * TILE_CELL_W + scroll.x) / TILE_RADIUS;
       const y = -(wrap(slot.row * ch + scroll.y, H) - H / 2 + ch / 2);
       const k = THREE.MathUtils.smoothstep((H / 2 - Math.abs(y)) / ch, 0, 0.6);
-      q.setFromAxisAngle(Y, -a);
+      q.setFromAxisAngle(Y, -a).multiply(ON_ITS_SIDE);
       p.set(TILE_RADIUS * Math.sin(a), y, -TILE_RADIUS * Math.cos(a));
       s.setScalar(TILE_SCALE * Math.max(1e-3, k));
       return out.compose(p, q, s);
@@ -213,7 +233,7 @@ export function plateMatrix(
       const scale = 0.55;
       const turn = twist * Math.PI * 2;
       const step = turn / Math.max(1, n - 1);
-      const u = helixSlot(i, n, twist, phase, scroll.x);
+      const u = helixSlot(at, n, twist, phase, scroll.x);
       q.setFromAxisAngle(Y, u * step);
       // lying almost flat, stepping up — turned a quarter in its own plane,
       // so its right edge (where a ticket's username and number run) faces out
@@ -359,7 +379,28 @@ const ONE = new THREE.Vector3(1, 1, 1);
 const PULL = 1.1;
 /** how long a hovered plate takes to pop out (s), and how far: a fraction of its short side */
 const HOVER = 0.18;
-const POP = 0.18;
+const POP = 0.07;
+/**
+ * The Helix's cards opening a gap for a newcomer: each glides along (a
+ * spring damped just enough not to overshoot: smooth, no bounce), a beat
+ * after the card nearer the gap.
+ */
+const GLIDE_SPRING = 90;
+const GLIDE_DAMP = 2 * Math.sqrt(GLIDE_SPRING);
+const GLIDE_RIPPLE = 0.035;
+/** a gap's outline: how long it waits for the cards either side to clear (s), and how long it takes to draw in */
+const GAP_CLEAR = 0.35;
+const GAP_DRAW = 0.7;
+/** a tile coming onto the wall: from this far behind it, and this much smaller */
+const TILE_BEHIND = 0.6;
+const TILE_SHRINK = 0.12;
+/** and how long it takes (s), swinging in from this far round (radians) on the card's long axis */
+const TILE_APPEAR = 0.45;
+const TILE_SWING = 0.7;
+const SWING_AXIS = new THREE.Vector3(1, 0, 0);
+const swingQ = new THREE.Quaternion();
+/** a card waiting for its artwork: its outline draws in this quickly (s) */
+const WAIT_DRAW = 0.3;
 /** seconds a tile takes to come off the wall to the viewer, or go back */
 const TILE_PULL = 0.45;
 /** how quickly a let-go Tiles wall slows (per second) */
@@ -622,25 +663,30 @@ export class StackAnimator {
   beginIntro() {
     if (this.instant) return;
     this.introAt = 0;
+    this.rank = [];
     this.introN = 0;
     this.shown.fill(0);
   }
 
   /** when the opening holds plate i back until (s) */
   private introRelease(i: number) {
-    return (this.introN - 1) * OUTLINE_STAGGER + OUTLINE_DRAW + FILL_SETTLE + i * INTRO_STAGGER;
+    // the outlines draw, and the green cards come in over them, left to right along the formation
+    return (this.introN - 1) * OUTLINE_STAGGER + OUTLINE_DRAW + FILL_SETTLE + (this.rank[i] ?? i) * INTRO_STAGGER;
   }
 
   /** how far plate i's outline is drawn (0..1); 0 also when there's no opening to draw */
   outlineDrawn(i: number) {
+    // a gap opened for a newcomer: its outline, drawing in, until the card lands
+    if (this.gapDraw[i] >= 0) return this.gapDraw[i];
     if (this.introAt < 0 || (this.introN > 0 && i >= this.introN)) return 0;
-    return THREE.MathUtils.clamp((this.introAt - i * OUTLINE_STAGGER) / OUTLINE_DRAW, 0, 1);
+    return THREE.MathUtils.clamp((this.introAt - (this.rank[i] ?? i) * OUTLINE_STAGGER) / OUTLINE_DRAW, 0, 1);
   }
 
   /** how far plate i's fill has eased back to the page's colour (0..1) */
   outlineSettled(i: number) {
+    if (this.gapDraw[i] >= 0) return 1;
     if (this.introAt < 0) return 0;
-    return THREE.MathUtils.clamp((this.introAt - i * OUTLINE_STAGGER - OUTLINE_DRAW) / FILL_SETTLE, 0, 1);
+    return THREE.MathUtils.clamp((this.introAt - (this.rank[i] ?? i) * OUTLINE_STAGGER - OUTLINE_DRAW) / FILL_SETTLE, 0, 1);
   }
 
   /** how far plate i has come in over its outline (0..1) */
@@ -671,10 +717,119 @@ export class StackAnimator {
     }
   }
 
+  /** the plates in order along the formation: left to right along the Helix, else as numbered; and each plate's place in it */
+  private order: number[] = [];
+  private rank: number[] = [];
+  private rankPlates(n: number, params: StackParams) {
+    // through the opening the order holds as it was when it began: the Helix turning doesn't reshuffle it
+    if (this.introAt >= 0 && this.rank.length >= n) return;
+    const key = (i: number) => (this.shape === 'Helix' ? helixSlot(this.pos(i), n, params.twist, this.phase, this.scroll.x) : i);
+    this.order = Array.from({ length: n }, (_, i) => i).sort((a, b) => key(a) - key(b));
+    this.order.forEach((i, r) => (this.rank[i] = r));
+  }
+
+  /** the plates in order along the formation (left to right along the Helix), so their artwork's fetched in that order */
+  get plateOrder(): readonly number[] {
+    return this.order;
+  }
+
+  /**
+   * The Helix as a ring of places: each plate's place in it (whole numbers,
+   * 0 to the count), and how far it still has to glide to get there. A
+   * newcomer opens a gap: every plate from its place on moves one along and
+   * glides there; the one pushed off the far end comes round into the gap,
+   * hidden, to be the newcomer.
+   */
+  private ring = new Float32Array(MAX_PLATES).map((_, i) => i);
+  private glide = new Float32Array(MAX_PLATES);
+  /** the glide's speed (it springs), and how long a card waits before it starts (the ripple from the gap) */
+  private glideV = new Float32Array(MAX_PLATES);
+  private glideWait = new Float32Array(MAX_PLATES);
+  /** a gap's outline, drawing in (0..1) while its newcomer's on its way; -1: none. And how long it waits for the cards to clear first */
+  private gapDraw = new Float32Array(MAX_PLATES).fill(-1);
+  private gapWait = new Float32Array(MAX_PLATES);
+  /** that outline is a card waiting for its artwork (it draws quicker than a gap's) */
+  private waitOutline = new Uint8Array(MAX_PLATES);
+  private ringN = 0;
+
+  /**
+   * Where the wall stands (in the formation's space): built round the viewer
+   * wherever they are, facing the way they look, so going to the wall moves
+   * the cards and not the camera. Identity: round the formation's middle.
+   */
+  readonly wallFrame = new THREE.Matrix4();
+
+  /**
+   * Plates whose place on the wall (going to it, or coming from it) is off
+   * screen: they don't fly across the view to or from the back of the drum.
+   */
+  private offstage = new Uint8Array(MAX_PLATES);
+  setOffstage(mask: readonly boolean[] | null) {
+    this.offstage.fill(0);
+    mask?.forEach((off, i) => (this.offstage[i] = off ? 1 : 0));
+  }
+
+  /** where plate i sits along the ring now, gliding included */
+  pos(i: number) {
+    return this.ring[i] + this.glide[i];
+  }
+
+  /** plate i's place in the ring (a whole number), as its ticket is dealt by */
+  ringPlace(i: number) {
+    return this.ring[i];
+  }
+
+  /** the ring place showing nearest the middle of the Helix */
+  middlePlace(n: number, twist: number) {
+    let best = 0, bestD = Infinity;
+    for (let i = 0; i < n; i++) {
+      const d = Math.abs(helixSlot(this.ring[i], n, twist, this.phase, this.scroll.x) - (n - 1) / 2);
+      if (d < bestD) (bestD = d), (best = this.ring[i]);
+    }
+    return best;
+  }
+
+  /** Open a gap at ring place `at` for a newcomer: returns the plate that comes into it (hidden until its artwork's in). */
+  openGap(at: number, n: number) {
+    let newcomer = -1;
+    for (let i = 0; i < n; i++) {
+      if (this.ring[i] < at) continue;
+      // further from the gap, a beat later
+      this.glideWait[i] = Math.max(this.glideWait[i], (this.ring[i] - at) * GLIDE_RIPPLE);
+      this.ring[i] += 1;
+      this.glide[i] -= 1;
+      if (this.ring[i] >= n) newcomer = i;
+    }
+    if (newcomer >= 0) {
+      this.ring[newcomer] = at;
+      this.glide[newcomer] = 0;
+      this.glideV[newcomer] = 0;
+      this.glideWait[newcomer] = 0;
+      this.gapDraw[newcomer] = 0;
+      this.gapWait[newcomer] = GAP_CLEAR;
+      this.shown[newcomer] = 0;
+    }
+    return newcomer;
+  }
+
   /** Plate i's artwork is in (it drops into place), or gone again (it vanishes until the next is). */
   setReady(i: number, ready = true) {
     this.ready[i] = ready ? 1 : 0;
-    if (!ready) this.shown[i] = 0;
+    if (!ready) {
+      this.shown[i] = 0;
+      // once the opening's over, a card waiting for its artwork (dealt a new ticket as the
+      // Helix is dragged, say) shows its outline, drawing in quickly, until it flies in
+      if (this.gated && this.shape === 'Helix' && this.openingOver() && this.gapDraw[i] < 0) {
+        this.gapDraw[i] = 0;
+        this.gapWait[i] = 0;
+        this.waitOutline[i] = 1;
+      }
+    }
+  }
+
+  /** whether the opening's done (or there wasn't one) */
+  private openingOver() {
+    return this.introAt < 0 || this.introN === 0 || this.introAt > this.introRelease(this.introN - 1) + APPEAR;
   }
 
   /**
@@ -786,13 +941,42 @@ export class StackAnimator {
     let reach = 0, deepest = -Infinity;
     for (let i = 0; i < n; i++) {
       const place = (this.places[i] ??= new THREE.Matrix4());
-      plateMatrix(this.shape, i, n, w, h, t, params, this.phase, spreadTo, place, this.scroll);
+      plateMatrix(this.shape, i, n, w, h, t, params, this.phase, spreadTo, place, this.scroll, this.pos(i));
+      if (this.shape === 'Tiles') place.premultiply(this.wallFrame);
       pb.setFromMatrixPosition(place);
       reach = Math.max(reach, pb.length());
       deepest = Math.max(deepest, pb.z);
     }
     reach += plateR;
     this.reach = reach;
+    this.rankPlates(n, params);
+    // the ring: plates back in order when the count changes; a gap opened for a newcomer closing as the cards glide
+    if (n !== this.ringN) {
+      this.ringN = n;
+      for (let i = 0; i < MAX_PLATES; i++) (this.ring[i] = i), (this.glide[i] = 0), (this.glideV[i] = 0), (this.glideWait[i] = 0);
+    }
+    // each card springs along to its new place, a beat after the one nearer the gap: a ripple, a little bounce
+    const step = Math.min(dt, 1 / 30);
+    for (let i = 0; i < n; i++) {
+      if (this.glide[i] === 0 && this.glideV[i] === 0) continue;
+      if (this.glideWait[i] > 0) {
+        this.glideWait[i] -= dt;
+        continue;
+      }
+      this.glideV[i] += (-GLIDE_SPRING * this.glide[i] - GLIDE_DAMP * this.glideV[i]) * step;
+      this.glide[i] += this.glideV[i] * step;
+      if (Math.abs(this.glide[i]) < 1e-3 && Math.abs(this.glideV[i]) < 1e-2) (this.glide[i] = 0), (this.glideV[i] = 0);
+    }
+    // a gap's outline waits for the cards to clear, draws in, and goes once its card has landed
+    // (gaps and waiting cards are the Helix's: any other formation has none)
+    if (this.shape !== 'Helix') this.gapDraw.fill(-1), this.waitOutline.fill(0);
+    for (let i = 0; i < n; i++) {
+      if (this.gapDraw[i] < 0) continue;
+      if (this.gapWait[i] > 0) this.gapWait[i] -= dt;
+      else if (this.shown[i] >= 1) (this.gapDraw[i] = -1), (this.waitOutline[i] = 0);
+      else this.gapDraw[i] = Math.min(1, this.gapDraw[i] + dt / (this.waitOutline[i] ? WAIT_DRAW : GAP_DRAW));
+    }
+
     // tilted plates can reach a half-diagonal past their centres
     this.front.set(0, 0, Math.max(FRONT.z, deepest + plateR + 0.1));
 
@@ -812,13 +996,18 @@ export class StackAnimator {
         const k = ease(THREE.MathUtils.clamp((this.move - start) / (1 - stagger), 0, 1));
         if (i >= toN) {
           // a plate the new formation doesn't have flies off, up or down out of view
-          plateMatrix(this.from, i, fromN, w, h, t, params, this.phase, spreadFrom, mb, this.scroll);
+          plateMatrix(this.from, i, fromN, w, h, t, params, this.phase, spreadFrom, mb, this.scroll, this.pos(i));
+          if (this.from === 'Tiles') mb.premultiply(this.wallFrame);
           this.flyOff(mb, k);
         } else if (i >= fromKept) {
           // a plate the old one didn't have flies in from there
           this.flyOff(mb, 1 - k);
+        } else if (this.offstage[i] && this.from === 'Tiles') {
+          // off-screen on the wall: it doesn't come round from behind the viewer, it drops in from above
+          this.flyOff(mb, 1 - k);
         } else if (k < 1) {
-          plateMatrix(this.from, i, fromN, w, h, t, params, this.phase, spreadFrom, ma, this.scroll);
+          plateMatrix(this.from, i, fromN, w, h, t, params, this.phase, spreadFrom, ma, this.scroll, this.pos(i));
+          if (this.from === 'Tiles') ma.premultiply(this.wallFrame);
           ma.decompose(pa, qa, sa);
           mb.decompose(pb, qb, sb);
           pa.lerp(pb, k);
@@ -846,10 +1035,17 @@ export class StackAnimator {
         mb.elements[13] += this.aside.y * k;
         mb.elements[14] += this.aside.z * k;
       }
-      const want = this.introHolds(i) ? 0 : this.gated ? this.ready[i] : 1;
-      const shown = (this.shown[i] = this.instant ? Math.max(this.shown[i], want) : this.shown[i] + THREE.MathUtils.clamp(want - this.shown[i], 0, dt / APPEAR));
-      // a plate on its way in flies in at its full size, from out of view to its place
-      if (shown < 1) this.flyOff(mb, 1 - ease(shown));
+      // a newcomer waits until its gap's outline is drawn (a card just waiting for its artwork doesn't)
+      const gapHolds = this.gapDraw[i] >= 0 && this.gapDraw[i] < 1 && !this.waitOutline[i];
+      const want = this.introHolds(i) || gapHolds ? 0 : this.gated ? this.ready[i] : 1;
+      const appear = this.shape === 'Tiles' && this.move >= 1 ? TILE_APPEAR : APPEAR;
+      const shown = (this.shown[i] = this.instant ? Math.max(this.shown[i], want) : this.shown[i] + THREE.MathUtils.clamp(want - this.shown[i], 0, dt / appear));
+      // a plate on its way in flies in at its full size, from out of view to its place;
+      // on the wall a tile comes forward instead, from just behind it, growing a little as it fades in
+      if (shown < 1) {
+        if (this.shape === 'Tiles' && this.move >= 1) this.fromBehind(mb, shown);
+        else this.flyOff(mb, 1 - ease(shown));
+      }
       for (const mesh of meshes) mesh.setMatrixAt(i, mb);
     }
     this.lastN = n;
@@ -861,11 +1057,31 @@ export class StackAnimator {
     }
   }
 
+  /**
+   * A tile `shown` (0..1) of the way onto the wall: from just behind its
+   * place and a little smaller, swinging in on its upright edge like a door
+   * (a touch past flat, then settling).
+   */
+  private fromBehind(m: THREE.Matrix4, shown: number) {
+    if (shown >= 1) return;
+    const k = 1 - ease(shown);
+    // ease-out-back: overshoots a little before it lands
+    const c = 1.9, x = shown - 1;
+    const swing = 1 - (1 + (c + 1) * x * x * x + c * x * x);
+    m.decompose(pa, qa, sa);
+    nrm.copy(Z).applyQuaternion(qa);
+    pa.addScaledVector(nrm, -k * TILE_BEHIND);
+    sa.multiplyScalar(1 - k * TILE_SHRINK);
+    qa.multiply(swingQ.setFromAxisAngle(SWING_AXIS, swing * TILE_SWING));
+    m.compose(pa, qa, sa);
+  }
+
   /** A plate k (0..1) of the way off: away up or down, whichever side of the middle it's on, out of view. */
   private flyOff(m: THREE.Matrix4, k: number) {
     if (k <= 0) return;
     m.decompose(pa, qa, sa);
-    pa.y += Math.sign(pa.y || 1) * k * k * FLY_OFF;
+    // every plate comes in (and goes off) from above, so an opening reads as one sweep
+    pa.y += k * k * FLY_OFF;
     m.compose(pa, qa, sa);
   }
 

@@ -9,13 +9,19 @@ import { irrelevantControls, useHiddenControls } from './panelVisibility.ts';
 import { LIGHTING } from './lighting.ts';
 import { TicketMaker } from './TicketMaker.tsx';
 import { ThemeSwitch, ViewSwitch } from './ViewSwitch.tsx';
-import { onTicket, supabase, ticketCount, ticketImageUrl, ticketRange, type Ticket } from './tickets.ts';
+import { onTicket, supabase, ticketByUsername, ticketCount, ticketImageUrl, ticketPage, ticketRange, type Ticket } from './tickets.ts';
 import { withUrlDefaults, panelDefaults, flattenValues, writeUrl } from './urlState.ts';
 
 const PERFORMANCE_KEY = 'holocloth.performance';
 
 /** ?clean renders the cloth alone — no panel, no sticker sheet — for stills like the OG image */
-const CLEAN = new URLSearchParams(window.location.search).has('clean');
+/**
+ * ?shot=<username>: a still of that person's ticket on the card, nothing
+ * else on screen (implies ?clean), framed by ?cam/?target and lit by the
+ * panel's settings in the link. For the share image's cinematic shots.
+ */
+const SHOT = new URLSearchParams(window.location.search).get('shot');
+const CLEAN = !!SHOT || new URLSearchParams(window.location.search).has('clean');
 
 /**
  * ?embed: the stack set into another page (the Launch Week page's hero), no
@@ -49,7 +55,7 @@ const RENDER_DEFAULTS = {
   environment: 0.73,
   bloom: 0.25,
   bloomThreshold: 1.41,
-  noise: 0.15,
+  noise: 0.06,
   toneMapping: 'Neutral',
   occlusion: true,
   occlusionStrength: 1,
@@ -446,9 +452,9 @@ const BASE_PANEL = {
       default: 'Helix',
     },
     count: [40, 2, MAX_PLATES, 1],
-    twist: [0.5, 0, 1, 0.01],
-    spacing: [1.5, 0.3, 30, 0.1],
-    flow: [0.36, 0, 3, 0.01],
+    twist: [0.72, 0, 1, 0.01],
+    spacing: [9, 0.3, 30, 0.1],
+    flow: [0.1, 0, 3, 0.01],
     /** the plates as outlines on the page instead of metal */
     orient: {
       type: 'select' as const,
@@ -459,7 +465,8 @@ const BASE_PANEL = {
     axis: {
       type: 'select' as const,
       options: ['Upright', 'Sideways'],
-      default: 'Upright',
+      // on its side, running across the page, as the LW page has it
+      default: 'Sideways',
     },
     outlines: false,
     outlineWidth: [1, 0.5, 8, 0.1],
@@ -855,7 +862,7 @@ export default function App() {
     app.onHandStatus = setHandStatus;
     app.onLaser = setLaser;
     // the stack is made of everyone's tickets; new and remixed ones arrive live
-    const asPlate = (t: Ticket) => ({ id: t.id, url: ticketImageUrl(t), owner: t.username, number: t.number });
+    const asPlate = (t: Ticket) => ({ id: t.id, url: ticketImageUrl(t), owner: t.username, number: t.number, stickers: t.stickers });
     if (supabase) app.awaitTickets();
     const stopTickets = onTicket((t) => app.upsertTicket(asPlate(t)));
     // how many tickets there are; the scene fetches the ones it's about to
@@ -905,6 +912,26 @@ export default function App() {
         app.setBumpMap(bumpImg);
         app.setClothImage(clothImg);
         app.refreshGridArt();
+        if (SHOT) {
+          window.addEventListener('message', (e) => {
+            if (e.origin !== window.location.origin || e.data?.shot !== 'capture' || appRef.current !== app) return;
+            window.parent.postMessage({ shot: 'png', id: e.data.id, png: app.capturePng() }, window.location.origin);
+          });
+          ticketByUsername(SHOT.toLowerCase())
+            .then((t) => {
+              if (!t) throw new Error(`no ticket @${SHOT}`);
+              // shown in its own light, unless the link picks one
+              if (t.lighting && !new URLSearchParams(window.location.search).has('lighting')) dial.setValues({ lighting: t.lighting } as never);
+              return ticketPage(t);
+            })
+            .then((img) => {
+              if (appRef.current !== app) return;
+              app.showStill(img);
+              // let the card settle and the face's textures upload, then say so: the page asks for the still
+              window.setTimeout(() => window.parent.postMessage({ shot: 'ready' }, window.location.origin), 2500);
+            })
+            .catch((err) => console.warn('[shot]', err));
+        }
         if (CLEAN) {
           app.warmUp(6);
           app.frameCloth();
@@ -1215,9 +1242,12 @@ export default function App() {
           laser={laser}
           dark={params.theme === 'Dark'}
           onOpen={(open) => (open ? appRef.current?.beginTicket() : appRef.current?.endTicket())}
-          onArt={(drawn, etch) => (etch ? appRef.current?.etchTicket(drawn) : appRef.current?.retitleTicket(drawn))}
+          onArt={(drawn, how) => (how === 'etch' ? appRef.current?.etchTicket(drawn) : appRef.current?.retitleTicket(drawn))}
+          onSticker={(img, e) => carrySticker(img, e, (Math.random() - 0.5) * 28, false)}
+          stickers={() => appRef.current?.ticketStickers() ?? []}
+          onPlaceStickers={(list) => appRef.current?.placeStickers(list)}
           onSaved={(t) => {
-            appRef.current?.upsertTicket({ id: t.id, url: ticketImageUrl(t), owner: t.username, number: t.number });
+            appRef.current?.upsertTicket({ id: t.id, url: ticketImageUrl(t), owner: t.username, number: t.number, stickers: t.stickers });
             appRef.current?.showTicket(t.id);
           }}
         />

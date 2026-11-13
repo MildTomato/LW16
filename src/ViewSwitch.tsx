@@ -1,9 +1,40 @@
+import { motion } from 'motion/react';
+
 /**
- * How to see the tickets: as the Rolodex, the Wheel, the Helix, or as Tiles — an endless sheet you
- * drag and scroll. In the console's own type, bottom left.
+ * How to see the tickets: the Helix, or Tiles (a wall you drag and scroll).
+ * A pair of pills at the top, in the console's type, the chosen one filled.
+ * (The Rolodex and the Wheel are still in the panel.)
  */
 export function ViewSwitch({ view, dark, onView }: { view: string; dark: boolean; onView: (view: string) => void }) {
-  return <Switch label="View" options={VIEWS} value={view} dark={dark} onPick={onView} side="left" />;
+  const ink = dark ? '#e8e6e1' : '#1a1a1a';
+  const paper = dark ? '#000805' : '#f3f2ed';
+  return (
+    // a paper backing, so it reads over the wall's tiles as well as the bare room
+    <div style={{ ...TOP_STYLE, borderColor: ink, background: paper }} role="group" aria-label="View">
+      {VIEWS.map((v) => {
+        const on = view === v;
+        return (
+          <button
+            key={v}
+            type="button"
+            aria-pressed={on}
+            onClick={() => onView(v)}
+            style={{ ...PILL_STYLE, color: on ? paper : ink }}
+          >
+            {/* the filled pill slides from one to the other */}
+            {on && (
+              <motion.span
+                layoutId="view-pill"
+                style={{ ...FILL_STYLE, background: ink }}
+                transition={{ type: 'spring', stiffness: 520, damping: 38 }}
+              />
+            )}
+            <span style={{ position: 'relative' }}>{v}</span>
+          </button>
+        );
+      })}
+    </div>
+  );
 }
 
 /** Light or Dark: the room, bottom right */
@@ -11,7 +42,7 @@ export function ThemeSwitch({ theme, onTheme }: { theme: string; onTheme: (theme
   return <Switch label="Theme" options={THEMES} value={theme} dark={theme === 'Dark'} onPick={onTheme} side="right" />;
 }
 
-const VIEWS = ['Rolodex', 'Wheel', 'Helix', 'Tiles'];
+const VIEWS = ['Helix', 'Tiles'];
 const THEMES = ['Light', 'Dark'];
 
 /** a row of choices in the console's own type, the chosen one underlined */
@@ -54,6 +85,42 @@ function Switch({
     </div>
   );
 }
+
+const TOP_STYLE: React.CSSProperties = {
+  position: 'fixed',
+  top: 24,
+  left: '50%',
+  transform: 'translateX(-50%)',
+  zIndex: 10,
+  display: 'flex',
+  padding: 3,
+  gap: 2,
+  border: '1px solid',
+  borderRadius: 999,
+  boxShadow: '0 4px 16px rgba(0, 0, 0, 0.12)',
+  font: "11px/1 'Geist Mono', ui-monospace, monospace",
+  letterSpacing: '0.06em',
+  textTransform: 'uppercase',
+};
+
+const FILL_STYLE: React.CSSProperties = {
+  position: 'absolute',
+  inset: 0,
+  borderRadius: 999,
+};
+
+const PILL_STYLE: React.CSSProperties = {
+  position: 'relative',
+  background: 'transparent',
+  border: 'none',
+  borderRadius: 999,
+  padding: '7px 14px',
+  font: 'inherit',
+  letterSpacing: 'inherit',
+  textTransform: 'inherit',
+  cursor: 'pointer',
+  transition: 'color 0.2s',
+};
 
 const WRAP_STYLE: React.CSSProperties = {
   position: 'fixed',

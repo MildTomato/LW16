@@ -1,4 +1,5 @@
 import * as THREE from 'three';
+import { PAGE } from './gridArt.ts';
 
 /**
  * The engraver's old CRT screen, floating beside the card: where the ticket's layers
@@ -187,7 +188,7 @@ export class Monitor {
 
     // together: the whole design, or while the artwork's burning, what's cut so far
     // and the layer under way drawing in row by row behind the scan line
-    const tx = 24, ty = 66, tw = 196, th = 294;
+    const tx = 24, ty = 66, tw = 196, th = Math.round((196 * PAGE.h) / PAGE.w);
     g.strokeStyle = DIM;
     g.lineWidth = 1;
     g.strokeRect(tx - 0.5, ty - 0.5, tw + 1, th + 1);
@@ -215,7 +216,7 @@ export class Monitor {
 
     // isolated: each layer on its own, the one being cut outlined, the cut ones ticked
     const cols = 3, gx = 244, gy = 66, gap = 10;
-    const cw = Math.floor((SCREEN_W - 24 - gx - gap * (cols - 1)) / cols), chh = Math.round(cw * 1.5);
+    const cw = Math.floor((SCREEN_W - 24 - gx - gap * (cols - 1)) / cols), chh = Math.round((cw * PAGE.h) / PAGE.w);
     layers.forEach((l, i) => {
       const x = gx + (i % cols) * (cw + gap), y = gy + Math.floor(i / cols) * (chh + 30);
       const on = i === cutIndex, done = i < cutIndex;
