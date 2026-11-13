@@ -1,0 +1,40 @@
+<!doctype html>
+<!--
+  The site's share card (1200x630): a still of the Rolodex, captured from the
+  page itself (?clean, at 2x), with the UI's small mono type in two corners.
+  ?theme=light|dark  ?labels=0 for the bare capture
+  The bottom-left corner stays clear: X lays the link's domain over it.
+-->
+<html>
+<head>
+<meta charset="utf-8" />
+<style>
+  @font-face { font-family: 'Geist Mono'; src: url('../public/fonts/GeistMono-Regular.woff2') format('woff2'); }
+  html, body { margin: 0; width: 1200px; height: 630px; overflow: hidden; }
+  .card { position: relative; width: 1200px; height: 630px; background-size: 1200px 630px; }
+  .card.light { --ink: #161616; background-image: url('captures/rolodex-light.png'); }
+  .card.dark { --ink: #ecebe6; background-image: url('captures/rolodex-dark.png'); }
+  .label {
+    position: absolute; font: 13px/1 'Geist Mono', monospace; letter-spacing: 0.08em;
+    text-transform: uppercase; color: var(--ink); opacity: 0.82;
+  }
+  .tl { top: 40px; left: 48px; }
+  .tr { top: 40px; right: 48px; }
+  .br { bottom: 40px; right: 48px; }
+  .hide .label { display: none; }
+</style>
+</head>
+<body>
+  <div class="card" id="card">
+    <div class="label tl">Supabase</div>
+    <div class="label tr">Launch Week 16</div>
+    <div class="label br">Make your ticket &rarr;</div>
+  </div>
+  <script>
+    const q = new URLSearchParams(location.search);
+    const card = document.getElementById('card');
+    card.classList.add(q.get('theme') === 'dark' ? 'dark' : 'light');
+    if (q.get('labels') === '0') card.classList.add('hide');
+  </script>
+</body>
+</html>

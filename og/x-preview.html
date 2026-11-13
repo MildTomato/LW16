@@ -1,0 +1,54 @@
+<!doctype html>
+<!--
+  How the cards read in an X timeline: a post with a summary_large_image card
+  at feed width (516px), the domain laid over its bottom-left corner as X does.
+  ?img=out/site-light.png&text=...&ui=light|dark
+-->
+<html>
+<head>
+<meta charset="utf-8" />
+<style>
+  html, body { margin: 0; }
+  body { font: 15px/20px -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; }
+  .light { --bg: #fff; --fg: #0f1419; --muted: #536471; --line: #eff3f4; }
+  .dark { --bg: #000; --fg: #e7e9ea; --muted: #71767b; --line: #2f3336; }
+  .page { background: var(--bg); color: var(--fg); width: 600px; padding: 12px 0; }
+  .post { display: flex; gap: 8px; padding: 12px 16px; border-bottom: 1px solid var(--line); }
+  .avatar { width: 40px; height: 40px; border-radius: 50%; background: #3ecf8e; flex: none; display: grid; place-items: center; }
+  .avatar svg { width: 22px; }
+  .body { flex: 1; min-width: 0; }
+  .head { display: flex; gap: 4px; }
+  .name { font-weight: 700; }
+  .muted { color: var(--muted); }
+  .text { margin: 2px 0 12px; white-space: pre-line; }
+  .card { position: relative; border-radius: 16px; overflow: hidden; border: 1px solid var(--line); }
+  .card img { display: block; width: 100%; aspect-ratio: 1200 / 630; }
+  .domain {
+    position: absolute; left: 12px; bottom: 12px; padding: 0 4px; border-radius: 4px;
+    background: rgba(0, 0, 0, 0.77); color: #fff; font-size: 13px; line-height: 20px;
+  }
+  .actions { display: flex; justify-content: space-between; max-width: 425px; margin-top: 12px; color: var(--muted); font-size: 13px; }
+</style>
+</head>
+<body>
+  <div class="page" id="page">
+    <div class="post">
+      <div class="avatar"><svg viewBox="0 0 109 113"><path fill="#fff" d="M63.7 110.3c-2.9 3.6-8.6 1.6-8.7-3L54.1 40h45.6c8.3 0 12.9 9.5 7.8 16z"/><path fill="#fff" fill-opacity=".6" d="M45.3 2.1c2.9-3.6 8.6-1.6 8.7 3l.4 67.4H9.4c-8.3 0-12.9-9.5-7.8-16z"/></svg></div>
+      <div class="body">
+        <div class="head"><span class="name" id="name">Supabase</span><span class="muted" id="handle">@supabase · 2h</span></div>
+        <div class="text" id="text"></div>
+        <div class="card"><img id="img" alt="" /><span class="domain">holocloth-lilac.vercel.app</span></div>
+        <div class="actions"><span>💬 48</span><span>🔁 212</span><span>♡ 1.4K</span><span>📊 96K</span></div>
+      </div>
+    </div>
+  </div>
+  <script>
+    const q = new URLSearchParams(location.search);
+    document.getElementById('page').classList.add(q.get('ui') === 'dark' ? 'dark' : 'light');
+    document.getElementById('img').src = q.get('img') || 'out/site-light.png';
+    document.getElementById('text').textContent = q.get('text') || 'Launch Week 16 starts Monday. Make your ticket.';
+    if (q.get('name')) { document.getElementById('name').textContent = q.get('name'); const a = document.querySelector('.avatar'); a.style.background = '#a8b3ba'; a.innerHTML = ''; }
+    if (q.get('handle')) document.getElementById('handle').textContent = q.get('handle');
+  </script>
+</body>
+</html>

@@ -1,0 +1,112 @@
+/*
+ * Tailwind v4 for the shadcn components, without preflight: the scene's overlays keep the
+ * browser defaults and inline styles they were built on. Only the theme and utilities layers
+ * are loaded, and only classes used under src/ are generated.
+ */
+@layer theme, base, components, utilities;
+@import "tailwindcss/theme.css" layer(theme);
+@import "tailwindcss/utilities.css" layer(utilities) source("./");
+@import "tw-animate-css";
+
+/* dark: utilities follow a .dark class on an ancestor (html or body, so portalled popovers see it too) */
+@custom-variant dark (&:where(.dark, .dark *));
+
+/* the ticket console's paper and ink, as shadcn's tokens */
+:root {
+  --radius: 0.375rem;
+  --background: #e8e6e1;
+  --foreground: #1a1a1a;
+  --card: #e8e6e1;
+  --card-foreground: #1a1a1a;
+  --popover: #e8e6e1;
+  --popover-foreground: #1a1a1a;
+  --primary: #1a1a1a;
+  --primary-foreground: #e8e6e1;
+  --secondary: color-mix(in oklab, #1a1a1a 8%, #e8e6e1);
+  --secondary-foreground: #1a1a1a;
+  --muted: color-mix(in oklab, #1a1a1a 8%, #e8e6e1);
+  --muted-foreground: color-mix(in oklab, #1a1a1a 60%, #e8e6e1);
+  /* the highlighted option inverts, like a .pill on hover */
+  --accent: #1a1a1a;
+  --accent-foreground: #e8e6e1;
+  --destructive: #c4321e;
+  --border: #1a1a1a;
+  --input: #1a1a1a;
+  --ring: #1a1a1a;
+}
+
+.dark {
+  --background: #0c110f;
+  --foreground: #e8e6e1;
+  --card: #0c110f;
+  --card-foreground: #e8e6e1;
+  --popover: #0c110f;
+  --popover-foreground: #e8e6e1;
+  --primary: #e8e6e1;
+  --primary-foreground: #0c110f;
+  --secondary: color-mix(in oklab, #e8e6e1 10%, #0c110f);
+  --secondary-foreground: #e8e6e1;
+  --muted: color-mix(in oklab, #e8e6e1 10%, #0c110f);
+  --muted-foreground: color-mix(in oklab, #e8e6e1 60%, #0c110f);
+  --accent: #e8e6e1;
+  --accent-foreground: #0c110f;
+  --destructive: #e5553f;
+  --border: #e8e6e1;
+  --input: #e8e6e1;
+  --ring: #e8e6e1;
+}
+
+@theme inline {
+  --font-mono: "Geist Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+}
+
+/*
+ * The slice of preflight the shadcn components need, scoped to their data-slot attributes so
+ * nothing else on the page changes. In the base layer, so the components' utilities still win.
+ */
+@layer base {
+  :where([data-slot^="select"], [data-slot="button"]),
+  :where([data-slot^="select"], [data-slot="button"]) *,
+  :where([data-slot^="select"], [data-slot="button"]) ::before,
+  :where([data-slot^="select"], [data-slot="button"]) ::after {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+    border: 0 solid;
+  }
+  :where([data-slot="select-trigger"], [data-slot="button"]) {
+    appearance: none;
+    font: inherit;
+    letter-spacing: inherit;
+    text-transform: inherit;
+    color: inherit;
+    background-color: transparent;
+    cursor: pointer;
+  }
+  :where([data-slot^="select"], [data-slot="button"]) svg {
+    display: block;
+    vertical-align: middle;
+  }
+}

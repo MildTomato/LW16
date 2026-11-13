@@ -1,0 +1,8 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "rewrites": [{ "source": "/t/:username", "destination": "/api/t?username=:username" }],
+  "functions": {
+    "api/t.ts": { "includeFiles": "{dist/index.html,.env}" },
+    "api/og/[username].ts": { "includeFiles": "{api/fonts/**,.env}", "memory": 1024 }
+  }
+}

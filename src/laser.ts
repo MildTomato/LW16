@@ -16,14 +16,14 @@ const INK_DELTA = 0.025;
 /** gaps in a row narrower than this many cells are cut through, as one run */
 const BRIDGE = 2;
 /** a pass's length, s: the head's speed sets it, within these bounds */
-const MIN_SECONDS = 1.2;
-const MAX_SECONDS = 5;
+const MIN_SECONDS = 3.5;
+const MAX_SECONDS = 20;
 /** work units: a card-width cut is 1; moving without firing is this much quicker */
 const MOVE_COST = 0.15;
 /** a beat at each turn: the head stops, steps, and starts again */
 const TURN = 0.006;
 /** seconds per unit of work */
-const SECONDS_PER_WORK = 0.035;
+const SECONDS_PER_WORK = 0.16;
 
 /** a stretch of the route: cutting a run of ink, or moving (from row0 to row) without firing */
 type Segment = { t0: number; t1: number; row0: number; row: number; x0: number; x1: number; cut: boolean };
@@ -72,9 +72,16 @@ function runsOf(ink: Uint8Array, row: number) {
 
 /**
  * Plan the pass that turns `before` into `after` (both the whole card),
- * leaving uncut whatever `keepClear` covers (the ticket's lettering).
+ * leaving uncut whatever `keepClear` covers (the ticket's lettering), and
+ * cutting whatever `cutOut` covers (the owner's name, cut out of the face:
+ * lighter, not darker, so it isn't new ink).
  */
-export function planPass(before: CanvasImageSource, after: CanvasImageSource, keepClear?: CanvasImageSource | null): LaserPlan {
+export function planPass(
+  before: CanvasImageSource,
+  after: CanvasImageSource,
+  keepClear?: CanvasImageSource | null,
+  cutOut?: CanvasImageSource | null,
+): LaserPlan {
   if (!ctx) {
     const c = document.createElement('canvas');
     c.width = COLS;
@@ -88,6 +95,10 @@ export function planPass(before: CanvasImageSource, after: CanvasImageSource, ke
   if (keepClear) {
     const clear = coverage(keepClear, ctx);
     for (let i = 0; i < ink.length; i++) if (clear[i] > 0.5) ink[i] = 0;
+  }
+  if (cutOut) {
+    const cut = coverage(cutOut, ctx);
+    for (let i = 0; i < ink.length; i++) if (cut[i] > 0.2) ink[i] = 1;
   }
 
   // the route, in work units: cut each run, move between them

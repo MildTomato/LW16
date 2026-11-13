@@ -11,7 +11,10 @@ import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
  * camera) are what a face-on card mirrors; panels to the sides catch it
  * as it turns.
  */
-export const LIGHTING = ['Studio', 'Softbox', 'Strips', 'Window', 'Neon', 'Ring', 'Sunset', 'Supabase', 'Aurora', 'Green Neon'] as const;
+export const LIGHTING = ['Field', 'Field Green', 'Field Supabase', 'Field Studio', 'Studio', 'Softbox', 'Strips', 'Window', 'Neon', 'Ring', 'Sunset', 'Supabase', 'Aurora', 'Green Neon'] as const;
+
+/** a room painted with the page's colour field (Field and its variants) */
+export const isFieldRoom = (name: string) => name.startsWith('Field');
 
 /** Supabase green, #3ECF8E, as linear-ish light colour */
 const GREEN: [number, number, number] = [0.24, 0.81, 0.56];
@@ -20,6 +23,24 @@ type DirLight = { color: THREE.ColorRepresentation; intensity: number; position:
 
 /** the direct lights per setup; missing ones are off */
 const LIGHTS: Record<string, DirLight[]> = {
+  // the page's colour field as the room; one soft key from above for the glints
+  Field: [{ color: 0xffffff, intensity: 0.6, position: [0.5, 5, 3] }],
+  // the field in Supabase greens
+  'Field Green': [
+    { color: 0xf0fff8, intensity: 0.9, position: [0.5, 5, 3] },
+    { color: 0x8af0c4, intensity: 0.4, position: [-4, 1, 2] },
+  ],
+  // the field room, lit as Supabase is: a green key low at the side, a teal fill
+  'Field Supabase': [
+    { color: 0x3ecf8e, intensity: 1.3, position: [-5, 0.6, 3] },
+    { color: 0x1b6b8f, intensity: 0.4, position: [4, 3, 1] },
+  ],
+  // the field room, lit as Studio is: a cool rim, a warm rim and a white key
+  'Field Studio': [
+    { color: 0x7fd4ff, intensity: 1.0, position: [-4, 2.5, -3] },
+    { color: 0xff9ad5, intensity: 0.8, position: [4.5, -1.5, -2.5] },
+    { color: 0xffffff, intensity: 0.6, position: [1.5, 3, 4] },
+  ],
   Studio: [
     { color: 0x7fd4ff, intensity: 1.1, position: [-4, 2.5, -3] },
     { color: 0xff9ad5, intensity: 0.9, position: [4.5, -1.5, -2.5] },
@@ -106,6 +127,69 @@ function room(scene: THREE.Scene, tone: number) {
 const s = (k: number, rgb: [number, number, number]): [number, number, number] => [rgb[0] * k, rgb[1] * k, rgb[2] * k];
 
 /** The scene each setup's environment is rendered from. */
+/**
+ * A room painted with the colour field: a sphere all round, the field
+ * mirrored twice about it so it meets itself without a seam, and a soft
+ * bright patch overhead where the key light is.
+ */
+function fieldScene(field: HTMLImageElement, green = false, panels = true): THREE.Scene {
+  const scene = new THREE.Scene();
+  const c = document.createElement('canvas');
+  c.width = field.naturalWidth || 32;
+  c.height = field.naturalHeight || 48;
+  const g = c.getContext('2d')!;
+  if (green) {
+    // the field's light and shade, in Supabase greens (the field is pastel:
+    // its light and shade pulled darker first, so the greens run deep)
+    g.filter = 'grayscale(1) contrast(2.2) brightness(0.7)';
+    g.drawImage(field, 0, 0, c.width, c.height);
+    g.filter = 'none';
+    // one green, #3ECF8E, throughout — only its light and shade vary — so a
+    // card shows the same green whichever way it faces, on the stack or the wall
+    g.globalCompositeOperation = 'color';
+    g.fillStyle = '#3ecf8e';
+    g.fillRect(0, 0, c.width, c.height);
+    g.globalCompositeOperation = 'source-over';
+  } else {
+    // the field, richer: its greens and peaches carry as light, not just its blue
+    g.filter = 'saturate(1.9) contrast(1.15)';
+    g.drawImage(field, 0, 0, c.width, c.height);
+  }
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  // round the room three times, mirrored to meet itself, so the wall's
+  // columns, each facing a little differently, catch a different part of it;
+  // and top to bottom squeezed into the band round the horizon the cards
+  // mostly see, so its pinks, greens and peaches reach them, not only its blue
+  tex.wrapS = THREE.MirroredRepeatWrapping;
+  tex.wrapT = THREE.MirroredRepeatWrapping;
+  tex.repeat.set(6, 2);
+  tex.offset.set(0, 0.5);
+  tex.minFilter = tex.magFilter = THREE.LinearFilter;
+  tex.generateMipmaps = false;
+  tex.needsUpdate = true;
+  const room = new THREE.Mesh(
+    new THREE.SphereGeometry(10, 64, 32),
+    new THREE.MeshBasicMaterial({ map: tex, side: THREE.BackSide, color: new THREE.Color().setScalar(0.95) }),
+  );
+  scene.add(room);
+  if (!panels) return scene;
+  if (green) {
+    // bright sources to catch: a soft box overhead and two tall pale-mint
+    // strips at the sides, so the stack's metal glints (and glows) as it turns
+    panel(scene, 5, 4, s(2.2, [1, 1, 1]), [0, 8, 1]);
+    panel(scene, 0.8, 7, s(1.8, [0.75, 1, 0.88]), [-7, 0.5, 3]);
+    panel(scene, 0.8, 7, s(1.8, [0.75, 1, 0.88]), [7, 0.5, 3]);
+    // a low strip behind the viewer, just above eye line: a card shown
+    // square to the view mirrors this side, and leaning up toward the
+    // cursor sweeps it into the glint
+    panel(scene, 6, 1.6, s(1.6, [1, 1, 1]), [0, 1.8, 8]);
+  } else {
+    panel(scene, 5, 5, s(1.6, [1, 1, 1]), [0, 8, 1]);
+  }
+  return scene;
+}
+
 function environmentScene(name: string): THREE.Scene {
   if (name === 'Studio') return new RoomEnvironment();
   const scene = new THREE.Scene();
@@ -202,14 +286,36 @@ export class Lighting {
 
   constructor(private renderer: THREE.WebGLRenderer) {}
 
-  /** set up `name`; returns its environment for scene.environment */
-  use(name: string): THREE.Texture {
-    const setup = LIGHTS[name] ? name : 'Studio';
+  /**
+   * Field's room is painted with the page's colour field: the gradient the
+   * cards used to print, now the light they reflect. Give it the field
+   * image before using Field (until then Field falls back to Studio).
+   */
+  setField(field: HTMLImageElement) {
+    this.field = field;
+    for (const [key, env] of this.envs) {
+      if (!isFieldRoom(key)) continue;
+      env.dispose();
+      this.envs.delete(key);
+    }
+  }
+  private field: HTMLImageElement | null = null;
+
+  /**
+   * set up `name`; returns its environment for scene.environment. Smooth:
+   * a Field room without its bright panels — on a wall of flat cards, a
+   * panel catches one card and skips the next, so light jumps about rather
+   * than carrying across it
+   */
+  use(name: string, smooth = false): THREE.Texture {
+    const setup = LIGHTS[name] && (!isFieldRoom(name) || this.field) ? name : 'Studio';
     this.current = setup;
-    let env = this.envs.get(setup);
+    const plain = smooth && isFieldRoom(setup);
+    const key = plain ? `${setup}|smooth` : setup;
+    let env = this.envs.get(key);
     if (!env) {
       const pmrem = new THREE.PMREMGenerator(this.renderer);
-      const scene = environmentScene(setup);
+      const scene = isFieldRoom(setup) ? fieldScene(this.field!, setup === 'Field Green', !plain) : environmentScene(setup);
       env = pmrem.fromScene(scene, 0.04).texture;
       pmrem.dispose();
       scene.traverse((o) => {
@@ -217,7 +323,7 @@ export class Lighting {
         m.geometry?.dispose();
         (m.material as THREE.Material | undefined)?.dispose?.();
       });
-      this.envs.set(setup, env);
+      this.envs.set(key, env);
     }
     this.lights.forEach((light, i) => {
       const d = LIGHTS[setup][i];

@@ -201,13 +201,17 @@ export function nextClothShot(
   normal: THREE.Vector3,
   length: number,
   prev?: ClothShot,
+  /** a detail shot: in tight on the spot, whatever came before */
+  detail = false,
+  /** no wide shots (the Tiles wall: a wide shot shows the parts with no cards loaded) */
+  noWide = false,
 ): ClothShot {
   let kind: ClothShot['kind'];
   do {
     const r = Math.random();
-    kind = r < 0.45 ? 'close' : r < 0.8 ? 'medium' : 'wide';
-  } while (kind === prev?.kind);
-  const dist = { close: rand(1.1, 1.7), medium: rand(2.3, 3.1), wide: rand(4.2, 5.0) }[kind];
+    kind = detail ? 'close' : r < 0.45 ? 'close' : r < 0.8 || noWide ? 'medium' : 'wide';
+  } while (!detail && !noWide && kind === prev?.kind);
+  const dist = detail ? rand(0.45, 0.85) : { close: rand(1.1, 1.7), medium: rand(2.3, 3.1), wide: rand(4.2, 5.0) }[kind];
 
   // the front: the artwork faces +z
   const n = normal.clone();
@@ -293,5 +297,69 @@ export function nextClothShot(
     lightTo,
     lightUp: sweepAxis === lift ? side.clone() : lift.clone(),
     duration: length * rand(0.6, 1.5),
+  };
+}
+
+/**
+ * A shot of the Rolodex as a whole: the camera rides round its spine,
+ * looking down into the open ring (wide), across the fanned cards
+ * (medium), or close along the edge of the fan where the cards' faces
+ * catch the light (close) — always from outside the ring, never inside it.
+ * The light rides with the camera, raised, so it rakes the faces rather
+ * than glaring straight back.
+ */
+export function rolodexShot(
+  centre: THREE.Vector3,
+  spine: THREE.Vector3,
+  radius: number,
+  length: number,
+  prev?: ClothShot,
+): ClothShot {
+  let kind: ClothShot['kind'];
+  do {
+    const r = Math.random();
+    // the whole fan from above now and then, for air; mostly in among its edge
+    kind = r < 0.12 ? 'wide' : r < 0.52 ? 'medium' : 'close';
+  } while (kind === prev?.kind);
+  const axis = spine.clone().normalize();
+  // a frame round the spine
+  const ref = Math.abs(axis.y) > 0.9 ? new THREE.Vector3(1, 0, 0) : new THREE.Vector3(0, 1, 0);
+  const across = ref.clone().cross(axis).normalize();
+  // how far off the spine the camera looks (0: straight down the ring), and from where round it
+  const tilt = { wide: rand(0.6, 0.95), medium: rand(0.95, 1.3), close: rand(1.1, 1.4) }[kind];
+  // measured from the fan's outer edge, so even close in the camera's clear of every card
+  const dist = radius + { wide: rand(3.4, 4.6), medium: rand(1.9, 2.6), close: rand(1.1, 1.5) }[kind];
+  const round = rand(0, Math.PI * 2);
+  // the spine's end toward the viewer's side: look from the end the default view sees
+  const viewFrom = (a: number) =>
+    axis.clone().multiplyScalar(Math.cos(tilt)).addScaledVector(across.clone().applyAxisAngle(axis, a), Math.sin(tilt)).normalize();
+  // ride round the spine over the shot, slow for wide, more for close
+  const arc = either() * { wide: rand(0.25, 0.5), medium: rand(0.3, 0.6), close: rand(0.2, 0.4) }[kind];
+  const camFrom = centre.clone().addScaledVector(viewFrom(round), dist);
+  const camTo = centre.clone().addScaledVector(viewFrom(round + arc), dist * rand(0.9, 1));
+  // close: aim at the fan's edge on the camera's side, not the hollow middle
+  const edge = (a: number) =>
+    kind === 'close' ? centre.clone().addScaledVector(across.clone().applyAxisAngle(axis, a), radius * 0.55) : centre.clone();
+  const target = edge(round);
+  const targetTo = edge(round + arc);
+  const up = axis.clone();
+  const lightUp = axis.clone().cross(viewFrom(round)).normalize();
+  // the light high over the camera's shoulder, travelling with it
+  const lightFrom = camFrom.clone().addScaledVector(axis, dist * 0.5).addScaledVector(lightUp, dist * 0.3);
+  const lightTo = camTo.clone().addScaledVector(axis, dist * 0.5).addScaledVector(lightUp, -dist * 0.3);
+  return {
+    kind,
+    move: 'orbit',
+    target,
+    targetTo,
+    camFrom,
+    camTo,
+    up,
+    upTo: up.clone(),
+    ease: (['glide', 'glide', 'creep'] as const)[Math.floor(Math.random() * 3)],
+    lightFrom,
+    lightTo,
+    lightUp,
+    duration: length * rand(0.9, 1.6),
   };
 }

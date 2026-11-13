@@ -123,6 +123,8 @@ const MARK_FONT = 'Helvetica Neue, Helvetica, Arial, sans-serif';
 export interface TicketOwner {
   username: string;
   number?: number;
+  /** draw just one line, where it sits with both: the laser cuts them one at a time */
+  only?: 'name' | 'number';
 }
 
 /**
@@ -468,6 +470,11 @@ export function groundPage(fieldDataUrl: string): string {
   return pageSvg('', fieldDataUrl, false);
 }
 
+/** the ground of a plain metal card: one flat tone, the room giving it its colour */
+export function plainGroundPage(tone: string): string {
+  return page(`<rect width="${W}" height="${H}" fill="${tone}"/>`);
+}
+
 export function inkPage(linework: string): string {
   return page(`<g fill="none" stroke="${STROKE}" stroke-width="${STROKE_W}" stroke-linecap="round">
     ${linework}
@@ -495,7 +502,7 @@ export function ownerPage(o: TicketOwner): string {
     `<text transform="translate(${x} ${RULE_BOTTOM}) rotate(-90)">${escapeXml(text)}</text>`;
   return page(`<defs><style>@font-face { font-family: 'Geist Pixel Line'; src: url(${ownerFont}) format('woff2'); }</style></defs>
   <g fill="#1a1a1a" font-family="'Geist Pixel Line', monospace" font-size="${size}">
-    ${at(number ? W - RULE_X - line : W - RULE_X, name)}${number ? `
+    ${o.only === 'number' ? '' : at(number ? W - RULE_X - line : W - RULE_X, name)}${number && o.only !== 'name' ? `
     ${at(W - RULE_X, number)}` : ''}
   </g>`);
 }

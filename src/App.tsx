@@ -1,14 +1,14 @@
 import { useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { useDialKitController, DialRoot, DialStore, type DialConfig } from 'dialkit';
-import { HoloApp, type HoloParams, type ImagesState, type LaserStatus } from './scene.ts';
+import { HoloApp, SHAPE_TICKETS, type HoloParams, type ImagesState, type LaserStatus } from './scene.ts';
 import { STICKER_SHEET } from './stickers.ts';
 import { MAX_PLATES, STACK_OPTIONS } from './cardStack.ts';
 import { ENGINE_AVAILABLE, ENGINE_RANDOM, ENGINE_SYSTEMS } from './engineArt.ts';
 import { irrelevantControls, useHiddenControls } from './panelVisibility.ts';
 import { LIGHTING } from './lighting.ts';
 import { TicketMaker } from './TicketMaker.tsx';
-import { ViewSwitch } from './ViewSwitch.tsx';
+import { ThemeSwitch, ViewSwitch } from './ViewSwitch.tsx';
 import { onTicket, supabase, ticketCount, ticketImageUrl, ticketRange, type Ticket } from './tickets.ts';
 import { withUrlDefaults, panelDefaults, flattenValues, writeUrl } from './urlState.ts';
 
@@ -16,6 +16,18 @@ const PERFORMANCE_KEY = 'holocloth.performance';
 
 /** ?clean renders the cloth alone — no panel, no sticker sheet — for stills like the OG image */
 const CLEAN = new URLSearchParams(window.location.search).has('clean');
+
+/**
+ * ?embed: the stack set into another page (the Launch Week page's hero), no
+ * panel and none of the site's own controls until the page opens it full
+ * screen. The page says so with postMessage: { lw16: 'open' } / { lw16: 'close' },
+ * and keeps it in its theme with { lw16: 'theme', value: 'Light' | 'Dark' }.
+ */
+const EMBED = new URLSearchParams(window.location.search).has('embed');
+/** set into a page, tell it the scene is drawn: it keeps the stack hidden until then, so there's no loading flash */
+const tellPageReady = () => {
+  if (EMBED && window.parent !== window) window.parent.postMessage({ lw16: 'ready' }, window.location.origin);
+};
 
 /** ?panel=off hides the settings sidebar, ?panel=closed starts it collapsed; open by default */
 const SIDEBAR = new URLSearchParams(window.location.search).get('panel');
@@ -35,7 +47,7 @@ const RENDER_DEFAULTS = {
   background: '#0b0c12',
   exposure: 0.6,
   environment: 0.73,
-  bloom: 0.03,
+  bloom: 0.25,
   bloomThreshold: 1.41,
   noise: 0.15,
   toneMapping: 'Neutral',
@@ -52,8 +64,9 @@ const RENDER_DEFAULTS = {
  * with a brighter room, so the metal reads as reflections of daylight.
  */
 const THEME_VALUES: Record<string, { background: string; exposure: number; environment: number }> = {
-  Dark: { background: RENDER_DEFAULTS.background, exposure: RENDER_DEFAULTS.exposure, environment: RENDER_DEFAULTS.environment },
-  Light: { background: '#e8e6e1', exposure: 0.85, environment: 1.25 },
+  // a green-black ground, and the cards lit full: bright mint metal against the dark
+  Dark: { background: '#0c110f', exposure: 1.2, environment: 1.15 },
+  Light: { background: '#e8e6e1', exposure: 1.5, environment: 1.25 },
 };
 
 /** finish → surface response; presets reference these by name */
@@ -411,7 +424,7 @@ const BASE_PANEL = {
   lighting: {
     type: 'select' as const,
     options: [...LIGHTING],
-    default: 'Supabase',
+    default: 'Field Green',
   },
   /** Card mode: dragging the card spins it (and it settles back), or moves the camera, which stays put */
   drag: {
@@ -429,13 +442,27 @@ const BASE_PANEL = {
     shape: {
       type: 'select' as const,
       options: STACK_OPTIONS.filter((o) => o !== 'Single'),
-      // the stack opens as a spiral; Cycle moves through every formation in turn
+      // the stack opens as a helix; Cycle moves through every formation in turn
       default: 'Helix',
     },
-    count: [32, 2, MAX_PLATES, 1],
+    count: [40, 2, MAX_PLATES, 1],
     twist: [0.5, 0, 1, 0.01],
-    spacing: [1.5, 0.3, 6, 0.1],
+    spacing: [1.5, 0.3, 30, 0.1],
     flow: [0.36, 0, 3, 0.01],
+    /** the plates as outlines on the page instead of metal */
+    orient: {
+      type: 'select' as const,
+      options: ['Portrait', 'Landscape'],
+      default: 'Portrait',
+    },
+    /** the Helix standing up, or laid on its side so it runs across the screen */
+    axis: {
+      type: 'select' as const,
+      options: ['Upright', 'Sideways'],
+      default: 'Upright',
+    },
+    outlines: false,
+    outlineWidth: [1, 0.5, 8, 0.1],
   },
   hands: false,
   cinematic: false,
@@ -454,7 +481,7 @@ const BASE_PANEL = {
     owner: {
       type: 'select' as const,
       options: ['Mirror', 'Ink', 'Etched'],
-      default: 'Mirror',
+      default: 'Etched',
     },
     corner: [0.04, 0, 0.3, 0.005],
     /** the back of the card (and every plate): a mirror polish, or brushed metal */
@@ -462,6 +489,12 @@ const BASE_PANEL = {
       type: 'select' as const,
       options: ['Mirror', 'Brushed'],
       default: 'Mirror',
+    },
+    /** the face: plain metal the room colours (best in the Field lightings), the printed colour field, or a holographic foil */
+    surface: {
+      type: 'select' as const,
+      options: ['Room', 'Printed', 'Foil'],
+      default: 'Room',
     },
     shotLength: [2.2, 0.8, 6, 0.1],
     drama: [0.7, 0, 1, 0.01],
@@ -718,11 +751,101 @@ export default function App() {
   const [laser, setLaser] = useState<LaserStatus | null>(null);
   const [assetsReady, setAssetsReady] = useState(false);
   const [loaderGone, setLoaderGone] = useState(false);
+  // set into a page, the site's own controls only show once it's opened full screen
+  const [embedOpen, setEmbedOpen] = useState(false);
+  const controls = !CLEAN && (!EMBED || embedOpen);
+
+  // the page it's set into opens and closes it: open, the cards come back as metal
+  useEffect(() => {
+    if (!EMBED) return;
+    const onMessage = (e: MessageEvent) => {
+      if (e.origin !== window.location.origin) return;
+      if (e.data?.lw16 === 'closing') {
+        // on its way back to the page: the controls go first, the cards stay as they are
+        setEmbedOpen(false);
+        return;
+      }
+      if (e.data?.lw16 === 'frame') {
+        appRef.current?.setPageFrame(e.data.value ?? null);
+        return;
+      }
+      if (e.data?.lw16 === 'fit') {
+        // the page wants the stack to span this many px: the spacing's nudged
+        // till it does, measured once the plates have settled each time
+        fitTo = e.data.value;
+        if (!fitTimer) fitTimer = window.setInterval(fitStep, 120);
+        return;
+      }
+      if (e.data?.lw16 === 'theme') {
+        dial.setValues({ theme: e.data.value } as never);
+        return;
+      }
+      const open = e.data?.lw16 === 'open' ? true : e.data?.lw16 === 'close' ? false : null;
+      if (open === null) return;
+      setEmbedOpen(open);
+      // small in the page it has no grain, so it sits on the page's ground; open, it gets it back
+      dial.setValues({ render: { noise: open ? RENDER_DEFAULTS.noise : 0 } } as never);
+      appRef.current?.holdTitles(!open);
+      appRef.current?.setHero(!open);
+    };
+    let fitTo = 0, fitTimer = 0, last = -1;
+    let spacing = Number(new URLSearchParams(window.location.search).get('stack.spacing')) || 1.5;
+    const fitStep = () => {
+      const span = appRef.current?.stackSpan();
+      if (span == null) return;
+      const settled = Math.abs(span - last) < 1.5;
+      last = span;
+      if (!settled) return;
+      if (Math.abs(span - fitTo) < fitTo * 0.015) {
+        window.clearInterval(fitTimer);
+        fitTimer = 0;
+        window.parent.postMessage({ lw16: 'fitted' }, window.location.origin);
+        return;
+      }
+      spacing = Math.min(30, Math.max(0.3, spacing * (fitTo / span) ** 1.2));
+      dial.setValues({ stack: { spacing } } as never);
+    };
+    // the page keeps its own scrolling and Esc: in the hero the wheel scrolls
+    // the page, not the scene; Esc (with focus in here) closes it back
+    let small = true;
+    const onWheel = (e: WheelEvent) => {
+      if (!small) return;
+      e.stopPropagation();
+      e.preventDefault();
+      window.parent.postMessage({ lw16: 'wheel', dx: e.deltaX, dy: e.deltaY, mode: e.deltaMode }, window.location.origin);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') window.parent.postMessage({ lw16: 'escape' }, window.location.origin);
+    };
+    const onOpenState = (e: MessageEvent) => {
+      if (e.origin !== window.location.origin) return;
+      if (e.data?.lw16 === 'open') small = false;
+      if (e.data?.lw16 === 'close') small = true;
+    };
+    window.addEventListener('message', onMessage);
+    window.addEventListener('message', onOpenState);
+    window.addEventListener('wheel', onWheel, { capture: true, passive: false });
+    window.addEventListener('keydown', onKey);
+    return () => {
+      window.removeEventListener('message', onMessage);
+      window.removeEventListener('message', onOpenState);
+      window.removeEventListener('wheel', onWheel, { capture: true });
+      window.removeEventListener('keydown', onKey);
+      window.clearInterval(fitTimer);
+    };
+  }, [dial]);
 
   useEffect(() => {
     if (!hostRef.current) return;
     const app = new HoloApp(hostRef.current);
     appRef.current = app;
+    // set into a page, the page draws LW and 16 until it opens the stack full screen
+    if (EMBED) {
+      // in the page's hero: its own LW and 16, drawn closer in, a click opens it
+      app.holdTitles(true);
+      app.setHero(true, Number(new URLSearchParams(window.location.search).get('zoom')) || 1);
+      app.onPageTap = () => window.parent.postMessage({ lw16: 'tap' }, window.location.origin);
+    }
     app.onDecalSelect = (scale, rotation) => {
       dial.setValues({ images: { scale, rotation } } as never);
     };
@@ -790,7 +913,7 @@ export default function App() {
         setLoadPercent(100);
         app.reveal();
         setAssetsReady(true);
-        window.setTimeout(() => setLoaderGone(true), 550);
+        window.setTimeout(() => { setLoaderGone(true); tellPageReady(); }, 550);
       })
       .catch((err) => {
         console.error('[holocloth] asset load failed', err);
@@ -798,7 +921,7 @@ export default function App() {
         // never trap the user behind the loader
         app.reveal();
         setAssetsReady(true);
-        window.setTimeout(() => setLoaderGone(true), 550);
+        window.setTimeout(() => { setLoaderGone(true); tellPageReady(); }, 550);
       });
 
     // Version manager: DialKit already versions the dial values in-memory.
@@ -1068,25 +1191,26 @@ export default function App() {
           />,
           bumpAnchor,
         )}
-      {!CLEAN && faceStatus && FACE_NOTICE[faceStatus] && (
+      {controls && faceStatus && FACE_NOTICE[faceStatus] && (
         <div style={FACE_NOTICE_STYLE}>{FACE_NOTICE[faceStatus]}</div>
       )}
-      {!CLEAN && handStatus && (
+      {controls && handStatus && (
         <div style={FACE_NOTICE_STYLE}>
           {params.mode !== 'Poster' ? 'Hands hold the poster — set Mode to Poster' : HAND_NOTICE[handStatus]}
         </div>
       )}
-      {!CLEAN && SIDEBAR !== 'off' && (
+      {!CLEAN && !EMBED && SIDEBAR !== 'off' && (
         <DialRoot position="top-right" defaultOpen={SIDEBAR !== 'closed'} productionEnabled />
       )}
-      {!CLEAN && params.cards === 'Stack' && (
+      {controls && params.cards === 'Stack' && (
         <ViewSwitch
-          view={params.stack.shape === 'Tiles' ? 'Tiles' : 'Helix'}
+          view={params.stack.shape}
           dark={params.theme === 'Dark'}
-          onView={(shape) => dial.setValues({ stack: { shape } } as never)}
+          onView={(shape) => dial.setValues({ stack: { shape, ...(SHAPE_TICKETS[shape] ? { count: SHAPE_TICKETS[shape] } : {}) } } as never)}
         />
       )}
-      {!CLEAN && (
+      {controls && <ThemeSwitch theme={params.theme} onTheme={(theme) => dial.setValues({ theme } as never)} />}
+      {controls && (
         <TicketMaker
           laser={laser}
           dark={params.theme === 'Dark'}
