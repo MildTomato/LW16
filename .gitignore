@@ -6,3 +6,8 @@ tsconfig.tsbuildinfo
 .DS_Store
 .vercel
 supabase/.temp/
+
+# local secrets (the committed .env holds only public settings)
+.env.local
+.env.*.local
+og/out/

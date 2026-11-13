@@ -1,6 +1,6 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
-import { Lighting } from './lighting.ts';
+import { Lighting, isFieldRoom } from './lighting.ts';
 import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
 import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
 import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
@@ -17,9 +17,12 @@ import { LASER_COLS, LASER_ROWS, headAt, planPass, type LaserPlan } from './lase
 import { gridSvg, growthSvg, barsSvg, asciiSvg, asciiGrid, ditherSvg, ditherGrid, pageWith, groundPage, marksPage, ownerPage, loadOwnerFont, ASCII, sampleLuminance, loadImage, fetchDataUrl } from './gridArt.ts';
 import { FaceTracker } from './faceTracker.ts';
 import { MetalCard } from './card.ts';
-import { TILE_COUNT, TILE_RADIUS, tileTicket, type StackParams } from './cardStack.ts';
+import { Titles } from './titles.ts';
+// a card's ground when the room colours it: bright, plain metal
+import { PLAIN_GROUND } from './tickets.ts';
+import { ROLODEX_SPINE, WHEEL_SPINE, TILE_COUNT, TILE_RADIUS, tileTicket, type StackParams } from './cardStack.ts';
 import {
-  nextShot, shotCamera, shotLight, shotPose, nextClothShot, moveProgress, shotProgress, type Shot, type ClothShot,
+  nextShot, shotCamera, shotLight, shotPose, nextClothShot, rolodexShot, moveProgress, shotProgress, type Shot, type ClothShot,
 } from './cinematic.ts';
 import { RectAreaLightUniformsLib } from 'three/addons/lights/RectAreaLightUniformsLib.js';
 import { HandTracker, type HandsFrame } from './handTracker.ts';
@@ -50,6 +53,8 @@ export interface HoloParams {
     corner: number;
     /** the back: Mirror or Brushed */
     back?: string;
+    /** the face: plain metal the Room colours, the Printed colour field, or a holographic Foil */
+    surface?: string;
     /** a ticket's username and number: Mirror, Ink or Etched */
     owner?: string;
     /** roughly how long each cinematic shot holds (s), and how dramatic its light is */
@@ -150,6 +155,13 @@ export interface HoloParams {
   };
 }
 
+/** how far (world units) the rest of the Helix steps to the left while a card is out */
+const HELIX_ASIDE = 2.6;
+const camQ = new THREE.Quaternion(), camQe = new THREE.Quaternion(), camU0 = new THREE.Vector3(), camU1 = new THREE.Vector3();
+const IDENTITY_Q = new THREE.Quaternion();
+/** how much of the view's height a shown card fills */
+const PLATE_FILL = 0.66;
+const asideDir = new THREE.Vector3();
 /** how far the Tiles wall fades out behind a pulled-out tile */
 const TILE_VEIL = 0.7;
 /** how far ahead of the camera the veil hangs: nearer than any of the wall in view */
@@ -158,6 +170,8 @@ const TILE_VEIL_DIST = 3;
 const VEIL_TIME = 0.4;
 /** Tiles is lit up: its wall faces inward, away from most of the room's light */
 const TILES_LIGHT = 1.45;
+/** how far (radians) the Tiles wall's light is turned round from the Helix's */
+const TILES_LIGHT_TURN = THREE.MathUtils.degToRad(-134);
 /** and how far (radians) its light is tipped up toward the top of the wall */
 const TILES_LIGHT_TIP = 0.55;
 /** Tiles is seen from inside its drum, looking at the wall ahead */
@@ -167,11 +181,15 @@ const TILES_VIEW = {
   target: [0, 0, -2] as [number, number, number],
   fov: 56,
 };
+/** how much of the view's height the card fills while a ticket's being made */
+const FRONT_FILL = 0.58;
+/** and how far right of the card the view's centred, for the monitor */
+const FRONT_SHIFT = 0.8;
 /** the lens everywhere else */
 const LENS_FOV = 38;
 /** the view a page opens on, unless its link carries one */
 const DEFAULT_VIEW = {
-  camera: [4.315, 0.867, -2.903] as [number, number, number],
+  camera: [7.005, 1.436, -4.691] as [number, number, number],
   target: [0, -0.046, -0.034] as [number, number, number],
 };
 const TONE_MAPPINGS: Record<string, THREE.ToneMapping> = {
@@ -183,14 +201,12 @@ const TONE_MAPPINGS: Record<string, THREE.ToneMapping> = {
 /** the Flower artwork's photos: each a single stem on solid black */
 /** room for this many tickets in the stack, each at this size (a 2:3 page) */
 /**
- * Each card's artwork drawn at about the size it's shown: the Tiles wall's
- * cards are small, the Helix's bigger — and a pulled-out card, filling the
- * view, gets its own at full size (FOCUS_ART)
+ * The plate art pool: one for both views, so switching between them reloads
+ * nothing — the Helix's few tickets and the wall's on-screen ones fit — and
+ * a pulled-out card, filling the view, gets its own at full size (FOCUS_ART)
  */
-const POOLS = {
-  Helix: { count: 40, w: 640, h: 960 },
-  Tiles: { count: 64, w: 320, h: 480 },
-};
+const POOL = { count: 64, w: 480, h: 720 };
+const POOLS = { Helix: POOL, Tiles: POOL };
 const FOCUS_ART = { w: 1000, h: 1500 };
 /** how far round the view (stack units) a wall card still counts as on screen: about a card */
 const TILE_VIEW_MARGIN = 1.6;
@@ -204,6 +220,23 @@ const TICKET_RETRY_MS = 5000;
 const TICKET_PAGE = 48;
 /** the Helix shows the latest of the tickets, at most this many */
 const HELIX_TICKETS = 40;
+/** the laser's lettering passes, before the artwork's: the owner's number, then their name */
+const LETTER_PASSES = 2;
+/** how far (radians) the Rolodex turns for a pixel dragged across it */
+const ROLODEX_SPIN_PER_PX = 0.006;
+/** and how fast (radians a second) it can be flicked to glide */
+const ROLODEX_MAX_SPIN = 6;
+/** how often the Rolodex's reel cuts to a detail of one card, rather than the whole fan */
+const ROLODEX_DETAIL = 0.5;
+/** the wall in the reel: how far (rows, either side of the middle) its shots stay, and how fast it scrolls on (units a second) */
+const TILE_CINE_ROWS = 1.4;
+const TILE_CINE_SCROLL = 0.18;
+/** the Rolodex is a loose handful of them, open wide enough to see each */
+const ROLODEX_TICKETS = 16;
+/** the Wheel is a turn of them round its spine, spaced enough to see each */
+const WHEEL_TICKETS = 16;
+/** how many cards each formation starts with when picked from the view switch; the panel's Count can change it after */
+export const SHAPE_TICKETS: Record<string, number> = { Rolodex: ROLODEX_TICKETS, Wheel: WHEEL_TICKETS, Helix: HELIX_TICKETS };
 /** a ticket for the stack: its image (its linework alone) and its owner's username */
 type TicketSource = { id: string; url: string; owner: string; number: number };
 /** a slot of the plate art: which ticket's image it holds, whether that's in, and when it was last on a plate */
@@ -215,6 +248,20 @@ type TicketCut = {
   marks: HTMLImageElement;
   owner: HTMLImageElement | null;
   lettered: HTMLImageElement;
+  /** the same on plain metal, for the Room surface */
+  plain?: { stages: HTMLImageElement[]; lettered: HTMLImageElement };
+  /** the design it's drawn from, layer by layer */
+  design?: { system: string; seed: number }[];
+  /** the whole artwork's linework, for the monitor */
+  ink?: HTMLImageElement;
+  /** the linework alone, for the screen: built up a layer at a time, and each layer on its own */
+  inkStages?: HTMLImageElement[];
+  layerInks?: HTMLImageElement[];
+  /** the artwork's layers, as the engine made them (each names its generator) */
+  composition?: unknown[];
+  /** the owner a line at a time: the laser cuts the number, then the name */
+  ownerNumber?: HTMLImageElement | null;
+  ownerName?: HTMLImageElement | null;
 };
 /**
  * The laser cutting a ticket: which pass of how many (the last is the
@@ -488,6 +535,8 @@ export class HoloApp {
   private ticketArt: THREE.DataArrayTexture | null = null;
   private ticketCtx: CanvasRenderingContext2D | null = null;
   private ticketGroundImg: Promise<HTMLImageElement> | null = null;
+  /** whether the cards print their colour field (off in the Field room, which lights them with it) */
+  private groundPrinted = true;
   /** the pulled-out card's full-size artwork, and the job drawing it */
   private focusArt: THREE.DataTexture | null = null;
   private focusJob = 0;
@@ -504,6 +553,15 @@ export class HoloApp {
   private ticketing = false;
   /** the stack is the Tiles sheet: dragged and scrolled, not orbited */
   private tilesView = false;
+  /** the Rolodex is up: dragging spins it on its spine */
+  private rolodexView = false;
+  /** LW and 16, either side of the stack */
+  private titles = new Titles();
+  private titleInk = new THREE.Color();
+  /** whether the stack's opening has run */
+  private opened = false;
+  /** the view the camera is framed for: the stack's, Tiles, or square on to the card being made */
+  private view = 'Helix';
   /**
    * Tiles: a veil in the background's colour, just in front of the wall,
    * so the wall fades out while a tile is looked at
@@ -513,6 +571,8 @@ export class HoloApp {
     new THREE.MeshBasicMaterial({ transparent: true, opacity: 0, depthWrite: false, fog: false, toneMapped: false }),
   );
   private veilK = 0;
+  /** each setup light's own intensity (stepped back on the Tiles wall) */
+  private lightBase = new Map<THREE.Light, number>();
   /** how much brighter the view is lit (Tiles is turned up), eased */
   private viewLight = 1;
   private tileDrag: { id: number; x: number; y: number; t: number; vx: number; vy: number } | null = null;
@@ -522,6 +582,14 @@ export class HoloApp {
   /** the ticket's stages, ground first, and the pass the laser is on (cutting stage pass + 1) */
   private etchStages: HTMLImageElement[] = [];
   private etchPass = 0;
+  /** this card's number and name are cut (a new design only needs its artwork cut again) */
+  private lettersCut = false;
+  /** the laser's only cutting a new name into a finished card, then stopping */
+  private letterOnly = false;
+  /** every pass the laser makes: the number, the name, then each layer of the artwork */
+  private get etchPasses() {
+    return LETTER_PASSES + this.etchStages.length - 1;
+  }
   /** the ticket's lettering: all of it, its marks, its owner, and over the finished artwork (to plan its pass) */
   private etchCut: TicketCut | null = null;
   private letteringTexs: (THREE.Texture | null)[] = [];
@@ -560,6 +628,19 @@ export class HoloApp {
     // room, a cool rim, a warm rim and a white key)
     this.lighting = new Lighting(this.renderer);
     this.scene.environment = this.lighting.use('Studio');
+    for (const light of this.lighting.lights) this.lightBase.set(light, light.intensity);
+    // the Field room is painted with the page's colour field: once it's in,
+    // use it if that's the setup asked for
+    loadImage('/artwork/field.png')
+      .then((img) => {
+        if (this.disposed) return;
+        this.lighting.setField(img);
+        if (isFieldRoom(this.params?.lighting ?? 'Studio')) {
+          this.lighting.current = '';
+          if (this.params) this.applyParams(this.params);
+        }
+      })
+      .catch((err) => console.warn('[holocloth] the Field room has no field; Studio stands in', err));
     this.lightRig.add(...this.lighting.lights);
     this.scene.add(this.lightRig);
 
@@ -576,6 +657,7 @@ export class HoloApp {
     // the artwork as a metal card (Card mode), sized with the cloth
     this.card = new MetalCard(this.surface.texture, this.surface.stickerTexture);
     this.scene.add(this.card.group);
+    this.scene.add(this.titles.group);
     this.card.setDetail(this.holoMaterial.normalMap, this.holoMaterial.roughnessMap);
 
     this.clothMesh = new THREE.Mesh(undefined, this.holoMaterial);
@@ -621,7 +703,10 @@ export class HoloApp {
       if (this.cameraUrlTimer !== null) window.clearTimeout(this.cameraUrlTimer);
       this.cameraUrlTimer = window.setTimeout(() => {
         this.cameraUrlTimer = null;
+        // only the stack's own view, as you've left it: not the ticket-making view,
+        // the wall, or a move between views (a reload would open on those)
         if (this.cine || this.plateCam.k > 0 || this.disposed) return;
+        if (this.ticketing || this.tilesView || this.camMove) return;
         writeCameraUrl(this.camera.position, this.controls.target);
       }, 400);
     });
@@ -714,7 +799,7 @@ export class HoloApp {
     this.setCardMode(p.mode === 'Card');
     if (p.card) {
       this.card.setEtch(p.card.ink, p.card.etchDepth, p.card.etchBevel);
-      this.card.setOwnerFinish(p.card.owner ?? 'Mirror');
+      this.card.setOwnerFinish(p.card.owner ?? 'Etched');
       this.card.setCorner(p.card.corner);
       this.card.setBack(p.card.back ?? 'Mirror');
     }
@@ -739,7 +824,19 @@ export class HoloApp {
     // material.envMapIntensity is ignored when lighting comes from
     // scene.environment — the renderer reads scene.environmentIntensity
     this.scene.environmentIntensity = p.render.environment;
-    if ((p.lighting ?? 'Studio') !== this.lighting.current) this.scene.environment = this.lighting.use(p.lighting ?? 'Studio');
+    if ((p.lighting ?? 'Studio') !== this.lighting.current) this.useLighting();
+    // the card's surface: plain metal the room colours, the printed colour
+    // field, or a holographic foil; plates are drawn again when it changes
+    const surface = p.card?.surface ?? 'Room';
+    const printed = surface === 'Printed';
+    this.card.setFoil(surface === 'Foil');
+    // on plain metal the grooves cut darker, so the linework reads against the room's colour
+    this.card.setGrooveTone(printed ? 0.55 : 0.22);
+    if (printed !== this.groundPrinted) {
+      this.groundPrinted = printed;
+      this.pool = null;
+      this.applyStack();
+    }
     // turning the setup round the card slides its reflections across the metal
     const turn = THREE.MathUtils.degToRad(p.render.lightAngle ?? 0);
     this.scene.environmentRotation.y = turn;
@@ -760,8 +857,7 @@ export class HoloApp {
     this.renderer.toneMappingExposure = p.render.exposure;
     const tm = TONE_MAPPINGS[p.render.toneMapping] ?? THREE.AgXToneMapping;
     if (this.renderer.toneMapping !== tm) this.renderer.toneMapping = tm;
-    this.bloomPass.strength = p.render.bloom;
-    this.bloomPass.threshold = p.render.bloomThreshold;
+    this.applyBloom();
     this.grainPass.uniforms.uAmount.value = p.render.noise;
     u.uCavityAmount.value = p.render.occlusion ? p.render.occlusionStrength : 0;
     this.dofPass.enabled = p.render.dof;
@@ -878,7 +974,13 @@ export class HoloApp {
   beginTicket() {
     if (this.ticketing) return;
     this.ticketing = true;
+    this.lettersCut = false;
     this.focusPlate(null);
+    // a blank card: nothing on it until the laser cuts the new artwork in
+    this.surface.setClothImage(null);
+    this.onImagesChanged?.();
+    // and the engraver lowered over it
+    this.card.setGantry(true);
     this.applyStack();
   }
 
@@ -888,26 +990,52 @@ export class HoloApp {
    * marks, the owner's username and number), cut in the lettering's own
    * finish — its own layer, never part of the artwork.
    */
-  etchTicket(t: TicketCut) {
+  etchTicket(cut: TicketCut) {
+    // cut on the card the stack is made of: plain metal unless the Surface is printed
+    const t = !this.groundPrinted && cut.plain ? { ...cut, stages: cut.plain.stages, lettered: cut.plain.lettered } : cut;
     if (!this.ticketing || t.stages.length < 2) return;
     this.etchStages = t.stages;
     this.etchCut = t;
-    this.etchPass = 0;
     this.plainGroundTex?.dispose();
     this.plainGroundTex = new THREE.Texture(t.stages[0]);
     this.plainGroundTex.colorSpace = THREE.SRGBColorSpace;
     this.plainGroundTex.needsUpdate = true;
     this.card.setFacePlainGround(this.plainGroundTex);
-    this.setLettering(false);
+    this.letterOnly = false;
+    // a new design on a card whose number and name are already cut: only the artwork's cut again
+    if (this.lettersCut) {
+      this.etchPass = LETTER_PASSES;
+      this.setLettering(true, true);
+    } else {
+      this.etchPass = 0;
+      this.setLettering(false);
+    }
     this.startPass();
+    this.showOnMonitor();
   }
 
   /** A new username (or number): new lettering; once the laser has reached it, the card shows it at once. */
-  retitleTicket(t: TicketCut) {
+  retitleTicket(cut: TicketCut) {
     if (!this.ticketing) return;
+    const t = !this.groundPrinted && cut.plain ? { ...cut, lettered: cut.plain.lettered } : cut;
     this.etchCut = { ...t, stages: this.etchStages };
-    const done = this.etch === null;
-    this.setLettering(done || this.etchPass >= this.etchStages.length - 1, done);
+    // still on the number or the name: the laser starts the lettering again, with the new name
+    if (this.etch !== null && this.etchPass < LETTER_PASSES) {
+      this.etchPass = 0;
+      this.lettersCut = false;
+      this.startPass();
+      return;
+    }
+    // the card's finished: the laser comes back and cuts the new name in over the artwork
+    if (this.etch === null && this.etchStages.length) {
+      this.letterOnly = true;
+      this.etchPass = 0;
+      this.lettersCut = false;
+      this.startPass();
+      return;
+    }
+    // mid-artwork: the new name is shown at once, cut through
+    this.setLettering(true, true);
   }
 
   /**
@@ -915,7 +1043,7 @@ export class HoloApp {
    * laser reaches it the marks show, and the owner is cut — through the face
    * as the laser goes, then through the card once it's done.
    */
-  private setLettering(shown: boolean, through = false) {
+  private setLettering(shown: boolean, through = false, ownerOnly?: HTMLImageElement | null) {
     const t = this.etchCut;
     if (!t) return;
     const tex = (img: HTMLImageElement | null) => {
@@ -925,9 +1053,40 @@ export class HoloApp {
       return out;
     };
     for (const old of this.letteringTexs) old?.dispose();
-    this.letteringTexs = [tex(t.lettering), tex(t.marks), tex(t.owner)];
+    this.letteringTexs = [tex(t.lettering), tex(t.marks), tex(ownerOnly === undefined ? t.owner : ownerOnly)];
     const [all, marks, owner] = this.letteringTexs;
     this.card.setFaceLettering(all, marks, owner, shown ? (through ? 2 : 1) : 0);
+  }
+
+  /** The laser's done: it stops, and the card's as cut. */
+  private finishEtch() {
+    this.etch = null;
+    this.letterOnly = false;
+    this.card.setLaser(null);
+    this.onLaser?.(null);
+    this.showOnMonitor();
+  }
+
+  /** The engraver's screen: the design, each layer alone and all together, and what the laser's doing with it. */
+  private showOnMonitor() {
+    const t = this.etchCut;
+    if (!t) return this.card.monitor.set(null);
+    // the layers by the names they're picked by (an older ticket's by its engine's generators)
+    const names = t.design?.map((d) => d.system) ?? (t.composition ?? []).map((l) => String((l as { gen?: string }).gen ?? 'layer'));
+    const inks = t.layerInks ?? [];
+    const layers = names.map((name, i) => ({ name, ink: inks[i] ?? null }));
+    const done = this.etch === null;
+    const pass = this.etchPass;
+    const cutting = done
+      ? null
+      : pass < LETTER_PASSES
+        ? { kind: pass === 0 ? ('number' as const) : ('name' as const) }
+        : { kind: 'layer' as const, index: pass - LETTER_PASSES };
+    const progress = done ? 1 : (this.etch ?? 0);
+    const overall = done ? 1 : (pass + progress) / Math.max(1, this.etchPasses);
+    // the laser's own plan for the pass, so the screen burns in as the card does
+    const plan = !done && this.etchPlan ? { times: this.etchPlan.times, head: headAt(this.etchPlan, progress) } : undefined;
+    this.card.monitor.set({ layers, together: t.inkStages ?? [], cutting, progress, overall, plan, ticket: 'LW16' });
   }
 
   /** a texture of a stage, for what the laser hasn't cut yet */
@@ -940,21 +1099,35 @@ export class HoloApp {
   }
 
   /**
-   * The laser's next pass. A layer: what's cut so far is the ground, the next
-   * stage the artwork it cuts in. The lettering, last: the artwork stays as
-   * it is, and the lettering's own layer is cut in over it.
+   * The laser's next pass. The blank card comes with its marks (Petabyte,
+   * Prototype) already on it. First the laser cuts the owner's number out of
+   * it, then their name; once both are cut they open right through the card.
+   * Then a pass per layer of the artwork: what's cut so far is the ground,
+   * the next stage the artwork it cuts in, keeping clear of the lettering.
    */
-  private startPass() {
-    const last = this.etchStages.length - 1;
-    const ground = this.etchStages[Math.min(this.etchPass, last)];
-    this.setGround(ground);
-    if (this.etchPass < last) {
-      const next = this.etchStages[this.etchPass + 1];
+  private startPass(): void {
+    const t = this.etchCut!;
+    if (this.etchPass < LETTER_PASSES) {
+      // on the blank card, or (relettering a finished one) over its artwork
+      const bare = this.letterOnly ? this.etchStages[this.etchStages.length - 1] : this.etchStages[0];
+      this.setGround(bare);
+      // the number alone, then the whole owner (the number already cut, so only the name's left)
+      const line = this.etchPass === 0 ? (t.ownerNumber ?? null) : (t.ownerName ?? null);
+      // nothing to cut on this pass (no name yet): straight on to the next
+      if (!line) {
+        this.etchPass++;
+        if (this.etchPass === LETTER_PASSES) this.lettersCut = true;
+        if (this.letterOnly && this.etchPass === LETTER_PASSES) return this.finishEtch();
+        return this.startPass();
+      }
+      this.etchPlan = planPass(bare, bare, null, line);
+      this.setLettering(true, false, this.etchPass === 0 ? (t.ownerNumber ?? null) : undefined);
+    } else {
+      const ground = this.etchStages[this.etchPass - LETTER_PASSES];
+      const next = this.etchStages[this.etchPass - LETTER_PASSES + 1];
+      this.setGround(ground);
       this.swapClothArt(next);
       this.etchPlan = planPass(ground, next, this.etchCut?.lettering);
-    } else {
-      this.etchPlan = planPass(ground, this.etchCut!.lettered);
-      this.setLettering(true);
     }
     this.card.setLaserPlan(this.etchPlan.times, LASER_COLS, LASER_ROWS, this.etchPlan.seconds);
     this.etch = 0;
@@ -965,6 +1138,9 @@ export class HoloApp {
   endTicket() {
     if (!this.ticketing) return;
     this.ticketing = false;
+    this.card.setGantry(false);
+    // a card flipped while it was being made goes back front-on: the stack's not left turned round
+    this.card.faceFront();
     this.etch = null;
     this.etchStages = [];
     this.card.setLaser(null);
@@ -1002,8 +1178,17 @@ export class HoloApp {
   /** the ticket plate i shows: the Helix the latest few, Tiles every one as it scrolls */
   private ticketForPlate(i: number) {
     const n = this.ticketTotal;
-    if (this.tilesView) return this.ticketAtPlace(tileTicket(i, n, this.card.tilesScrollY, this.card.dims.h));
-    return this.ticketAtPlace(n - Math.min(n, HELIX_TICKETS) + i);
+    // the Helix shows the latest few; the wall starts at them too, so the
+    // cards that fly from the one to the other keep their tickets on the way
+    const latest = n - Math.min(n, HELIX_TICKETS);
+    if (this.tilesView) return this.ticketAtPlace((tileTicket(i, n, this.card.tilesScrollY, this.card.dims.h) + latest) % n);
+    // the formation shows the latest as many as it has cards, starting over when it has more cards than tickets
+    const count = this.card.plateCount;
+    // the Helix has no end: each time a card comes back round it's a whole
+    // spiral's worth further back through the tickets
+    const lap = this.params?.stack?.shape === 'Helix' ? this.card.helixLap(i) : 0;
+    const k = (Math.max(0, n - count) + i - lap * count) % n;
+    return this.ticketAtPlace(k < 0 ? k + n : k);
   }
 
   /**
@@ -1073,9 +1258,30 @@ export class HoloApp {
     return out;
   }
 
+  /** The lighting setup the panel asks for. */
+  private useLighting() {
+    this.scene.environment = this.lighting.use(this.params?.lighting ?? 'Studio');
+    for (const light of this.lighting.lights) this.lightBase.set(light, light.intensity);
+  }
+
+  /**
+   * The bloom: just as the panel's sliders set it.
+   */
+  private applyBloom() {
+    const r = this.params?.render;
+    if (!r) return;
+    this.bloomPass.strength = r.bloom;
+    this.bloomPass.threshold = r.bloomThreshold;
+  }
+
   /** Size the plate art for the view: a new pool, its slots empty, refilled as plates are given tickets. */
   private usePool(kind: PoolKind) {
     if (this.pool === kind) return;
+    // the same pool for both views: keep it, and every image in it
+    if (this.pool && POOLS[this.pool] === POOLS[kind]) {
+      this.pool = kind;
+      return;
+    }
     this.pool = kind;
     this.ticketArt?.dispose();
     this.ticketArt = null;
@@ -1174,7 +1380,12 @@ export class HoloApp {
     ictx.drawImage(octx.canvas, 0, 0);
     ictx.globalCompositeOperation = 'source-over';
     ctx.setTransform(1, 0, 0, -1, 0, h);
-    ctx.drawImage(l.ground, 0, 0, w, h);
+    if (this.groundPrinted) ctx.drawImage(l.ground, 0, 0, w, h);
+    else {
+      // plain metal: the room gives it its colour
+      ctx.fillStyle = PLAIN_GROUND;
+      ctx.fillRect(0, 0, w, h);
+    }
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.drawImage(ictx.canvas, 0, 0);
     const px = ctx.getImageData(0, 0, w, h).data;
@@ -1254,13 +1465,24 @@ export class HoloApp {
     this.card.setStack({
       ...p.stack,
       cards: this.ticketing ? 'One' : p.cards,
-      count: tiles && this.ticketTotal ? TILE_COUNT : Math.min(this.ticketTotal, HELIX_TICKETS) || p.stack.count,
+      // the wall is always full; every other formation has as many cards as the panel's Count
+      count: tiles && this.ticketTotal ? TILE_COUNT : p.stack.count,
     });
     const tilesView = tiles && !this.ticketing && p.cards === 'Stack';
-    // into (or out of) Tiles, the camera eases round to suit
-    if (tilesView !== this.tilesView) this.frameView(tilesView ? 'Tiles' : 'Helix');
+    // into (or out of) Tiles, or making a ticket, the camera eases round to suit
+    const view = this.ticketing ? 'Front' : tilesView ? 'Tiles' : 'Helix';
+    if (view !== this.view) this.frameView(view);
+    this.view = view;
+    const viewChanged = tilesView !== this.tilesView;
     this.tilesView = tilesView;
-    this.controls.enabled = !tilesView;
+    // the Rolodex and the wall are dragged themselves, not orbited round
+    // the Wheel spins on its spine the same way
+    this.rolodexView = (p.stack.shape === 'Rolodex' || p.stack.shape === 'Wheel') && !this.ticketing && p.cards === 'Stack';
+    this.controls.enabled = !tilesView && !this.rolodexView && !this.heroMode;
+    // the wall is shaded as one smooth curve: light sweeps across it in one band
+    this.card.setTileCurve(tilesView);
+    if (viewChanged) this.useLighting();
+    this.applyBloom();
     this.usePool(tilesView ? 'Tiles' : 'Helix');
     this.plateTickets = [];
     this.assignPlates();
@@ -1477,6 +1699,63 @@ export class HoloApp {
     return this.surface.clothImage !== null;
   }
 
+  /** the page the stack's set into draws its own LW and 16; the scene's are held back meanwhile */
+  private titlesHeld = false;
+
+  /** where on the canvas (px) the embedding page wants the scene drawn, as if the canvas were only that big */
+  private pageFrame: { x: number; y: number; w: number; h: number } | null = null;
+
+  /**
+   * Draw the scene into part of the canvas, framed as if the canvas were that
+   * rect: the page opening the stack makes the canvas full-window at once, then
+   * eases this out to the whole window, so the cards come forward unclipped.
+   */
+  setPageFrame(frame: { x: number; y: number; w: number; h: number } | null) {
+    this.pageFrame = frame && frame.w > 0 && frame.h > 0 ? frame : null;
+    this.applyViewInset();
+    if (this.revealed) this.composer.render();
+  }
+
+  /** set into a page's hero: drawn closer in, dragged to spin, and a click is the page's (to open it) */
+  private heroMode = false;
+  private heroZoom = 1;
+  /** a click (not a drag) on the stack while it's in the page's hero */
+  onPageTap?: () => void;
+
+  /** In (or out of) the page's hero, drawn `zoom` times closer while there. */
+  setHero(on: boolean, zoom = this.heroZoom) {
+    this.heroMode = on;
+    this.heroZoom = zoom;
+    this.controls.enabled = !this.tilesView && !this.rolodexView && !on;
+    this.applyViewInset();
+    if (this.revealed) this.composer.render();
+  }
+
+  /** how wide (canvas px) the stack's plates reach across the screen as they are now, or null with none */
+  stackSpan() {
+    const mesh = this.card.stackSlab;
+    if (!mesh?.count) return null;
+    const { w, h } = this.card.dims;
+    const m = new THREE.Matrix4(), v = new THREE.Vector3();
+    let lo = Infinity, hi = -Infinity;
+    mesh.updateMatrixWorld(true);
+    for (let i = 0; i < mesh.count; i++) {
+      mesh.getMatrixAt(i, m);
+      m.premultiply(mesh.matrixWorld);
+      for (const [x, y] of [[-1, -1], [1, -1], [1, 1], [-1, 1]]) {
+        v.set((x * w) / 2, (y * h) / 2, 0).applyMatrix4(m).project(this.camera);
+        lo = Math.min(lo, v.x);
+        hi = Math.max(hi, v.x);
+      }
+    }
+    return ((hi - lo) / 2) * this.host.clientWidth;
+  }
+
+  /** Hold the scene's titles back (the embedding page has its own), or let them show again. */
+  holdTitles(held: boolean) {
+    this.titlesHeld = held;
+  }
+
   /** Show the cloth once the app's assets are in place. */
   reveal() {
     this.revealed = true;
@@ -1550,12 +1829,38 @@ export class HoloApp {
     c.forCard = this.cardMode;
     const light = this.cineLight;
     c.plate = null;
-    if (this.cardMode && this.card.stacked) {
+    if (this.cardMode && this.card.stacked && this.rolodexView && Math.random() < ROLODEX_DETAIL) {
+      // a detail: in tight on one card's face (its etch, its cut name), from where nothing's in the way
+      this.card.setPose(null);
+      c.shot = null;
+      const { shot, plate } = this.stackShot(c.cloth ?? undefined, true);
+      c.cloth = shot;
+      c.plate = plate;
+      this.placeCamera(shot.camFrom, shot.target, shot.up);
+      if (light) {
+        light.width = 0.45;
+        light.height = 4;
+      }
+    } else if (this.cardMode && this.card.stacked && this.rolodexView) {
+      // the Rolodex: shots of the whole fan, riding round its spine from outside the ring
+      this.card.setPose(null);
+      c.shot = null;
+      this.card.group.updateWorldMatrix(true, false);
+      const centre = new THREE.Vector3().setFromMatrixPosition(this.card.group.matrixWorld);
+      const spine = (this.params?.stack?.shape === 'Wheel' ? WHEEL_SPINE : ROLODEX_SPINE).clone().transformDirection(this.card.group.matrixWorld);
+      const { w } = this.card.dims;
+      c.cloth = rolodexShot(centre, spine, w * 0.62 * 1.45, this.shotLength, c.cloth ?? undefined);
+      this.placeCamera(c.cloth.camFrom, c.cloth.target, c.cloth.up);
+      if (light) {
+        light.width = 0.6;
+        light.height = 3;
+      }
+    } else if (this.cardMode && this.card.stacked) {
       // a stack: shots of real plates, gliding like the cloth's, from
       // angles where nothing stands between the camera and the plate
       this.card.setPose(null);
       c.shot = null;
-      const { shot, plate } = this.stackShot(c.cloth ?? undefined);
+      const { shot, plate } = this.stackShot(c.cloth ?? undefined, this.tilesView && Math.random() < 0.4);
       c.cloth = shot;
       c.plate = plate;
       this.placeCamera(shot.camFrom, shot.target, shot.up);
@@ -1600,15 +1905,25 @@ export class HoloApp {
    * move for it, and keeps it only if the plate is in clear view from both
    * ends of the move; after a few misses, a wider look at the whole stack.
    */
-  private stackShot(prev?: ClothShot) {
+  private stackShot(prev?: ClothShot, detail = false) {
     const point = new THREE.Vector3(), normal = new THREE.Vector3();
     const n = this.card.plateCount;
+    // on the wall, only cards that are in (their ticket loaded), away from the
+    // rows that wrap at the top and bottom: never the gaps
+    const tiles = this.tilesView;
+    const candidates = tiles
+      ? Array.from({ length: n }, (_, i) => i).filter((i) => {
+          if (this.card.plateShown(i) < 1) return false;
+          this.card.platePoint(i, 0, 0, point, normal);
+          return Math.abs(point.y - this.controls.target.y) < TILE_CINE_ROWS * this.card.dims.h * 0.42 * 1.12;
+        })
+      : null;
     let fallback: { shot: ClothShot; plate: { i: number; u: number; v: number; start: THREE.Vector3 } } | null = null;
     for (let attempt = 0; attempt < 24; attempt++) {
-      const i = Math.floor(Math.random() * n);
+      const i = candidates?.length ? candidates[Math.floor(Math.random() * candidates.length)] : Math.floor(Math.random() * n);
       const u = THREE.MathUtils.randFloat(-0.35, 0.35), v = THREE.MathUtils.randFloat(-0.35, 0.35);
       this.card.platePoint(i, u, v, point, normal);
-      const shot = nextClothShot(point, normal, this.shotLength, prev);
+      const shot = nextClothShot(point, normal, this.shotLength, prev, detail, tiles);
       const plate = { i, u, v, start: point.clone() };
       if (this.inClearView(shot.camFrom, point) && this.inClearView(shot.camTo, point)) return { shot, plate };
       // blocked: aim instead at whatever plate the camera does see that way
@@ -1732,9 +2047,12 @@ export class HoloApp {
     this.dofPass.setFocus(focusDist);
     // drama: dim the room so the sweep is the star, and push the light
     if (this.params) {
-      this.scene.environmentIntensity = this.params.render.environment * (1 - 0.78 * this.drama);
+      // (a stack keeps most of the room: its colour is the room's, and the reel shouldn't change it)
+      const dim = this.cardMode && this.card.stacked ? 0.2 : 0.78;
+      this.scene.environmentIntensity = this.params.render.environment * (1 - dim * this.drama);
     }
-    if (this.cineLight) this.cineLight.intensity = 6 + 34 * this.drama;
+    // the stack's many faces each mirror the strip: kept gentler there, or it glares out the frame
+    if (this.cineLight) this.cineLight.intensity = (this.cardMode && this.card.stacked ? 0.25 : 1) * (6 + 34 * this.drama);
   }
 
   /**
@@ -1781,7 +2099,7 @@ export class HoloApp {
     if (this.cardComesToView && !c.rest) {
       const { w, h } = this.card.dims;
       const half = Math.tan(THREE.MathUtils.degToRad(this.camera.fov) / 2);
-      const fill = Math.max(h / 2, w / 2 / this.camera.aspect) / half / 0.8;
+      const fill = Math.max(h / 2, w / 2 / this.camera.aspect) / half / PLATE_FILL;
       const dir = new THREE.Vector3();
       this.camera.getWorldDirection(dir);
       // in front of the whole formation, so nothing passes over it: if it
@@ -1805,7 +2123,7 @@ export class HoloApp {
     this.card.plateSpot(spot, normal, up);
     const { w, h } = this.card.dims;
     const half = Math.tan(THREE.MathUtils.degToRad(this.camera.fov) / 2);
-    const dist = Math.max(h / 2, w / 2 / this.camera.aspect) / half / 0.8;
+    const dist = Math.max(h / 2, w / 2 / this.camera.aspect) / half / PLATE_FILL;
     const at = spot.clone().addScaledVector(normal, dist);
     this.camera.position.copy(c.rest.position).lerp(at, k);
     this.controls.target.copy(c.rest.target).lerp(spot, k);
@@ -1970,21 +2288,28 @@ export class HoloApp {
     const h = this.host.clientHeight || window.innerHeight;
     this.camera.updateMatrixWorld();
     const v = new THREE.Vector3();
-    const paths: string[] = [];
+    const plates: { d: string; depth: number; i: number }[] = [];
     this.card.outlines().forEach((ring, i) => {
       let d = '';
+      let depth = 0;
       for (const p of ring) {
+        depth += p.distanceTo(this.camera.position) / ring.length;
         v.copy(p).project(this.camera);
         if (v.z < -1 || v.z > 1) return; // behind the camera: left out
         d += `${d ? 'L' : 'M'}${(((v.x + 1) / 2) * w).toFixed(2)} ${(((1 - v.y) / 2) * h).toFixed(2)}`;
       }
-      paths.push(`<path id="Plate ${i + 1}" d="${d}Z"/>`);
+      plates.push({ d, depth, i });
     });
+    // farthest first, each filled with the page, so nearer plates cover the
+    // lines behind them as they do on screen
+    plates.sort((a, b) => b.depth - a.depth);
+    const paths = plates.map(({ d, i }) => `<path id="Plate ${i + 1}" d="${d}Z"/>`);
     const bg = `#${this.background.getHexString()}`;
     const ink = this.background.getHSL({ h: 0, s: 0, l: 0 }).l < 0.5 ? '#ffffff' : '#111111';
+    const stroke = this.params?.stack?.outlineWidth ?? 1;
     const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}">
   <rect id="Background" width="${w}" height="${h}" fill="${bg}"/>
-  <g id="Plates" fill="none" stroke="${ink}" stroke-width="1" stroke-linejoin="round">
+  <g id="Plates" fill="${bg}" stroke="${ink}" stroke-width="${stroke}" stroke-linejoin="round">
     ${paths.join('\n    ')}
   </g>
 </svg>
@@ -1992,7 +2317,7 @@ export class HoloApp {
     navigator.clipboard?.writeText(svg).catch(() => {});
     const a = document.createElement('a');
     a.href = URL.createObjectURL(new Blob([svg], { type: 'image/svg+xml' }));
-    a.download = `holocloth-outlines-${new Date().toISOString().replace(/[:.]/g, '-')}.svg`;
+    a.download = `lw16-outlines-${new Date().toISOString().replace(/[:.]/g, '-')}.svg`;
     a.click();
     window.setTimeout(() => URL.revokeObjectURL(a.href), 1000);
   }
@@ -2207,8 +2532,8 @@ export class HoloApp {
       const plate = this.card.plateAt(this.raycastCard());
       this.plateClick = { id: e.pointerId, x: e.clientX, y: e.clientY, plate };
       if (this.card.focusedPlate !== null) return; // the camera is on it: no spinning or orbiting
-      // Tiles: the sheet is dragged
-      if (this.tilesView) {
+      // Tiles: the sheet is dragged; the Rolodex is spun
+      if (this.tilesView || this.rolodexView || this.heroMode) {
         this.tileDrag = { id: e.pointerId, x: e.clientX, y: e.clientY, t: performance.now(), vx: 0, vy: 0 };
         this.card.holdTiles(true);
         this.renderer.domElement.setPointerCapture(e.pointerId);
@@ -2272,8 +2597,13 @@ export class HoloApp {
     if (drag && e.pointerId === drag.id) {
       const now = performance.now();
       const dt = Math.max(1, now - drag.t) / 1000;
-      const u = this.tileUnitsPerPx();
-      const dx = (e.clientX - drag.x) * u, dy = (e.clientY - drag.y) * u;
+      // the wall moves with the pointer; the Rolodex turns, by an angle per pixel
+      const u = this.tilesView ? this.tileUnitsPerPx() : ROLODEX_SPIN_PER_PX;
+      // the hero's helix lies on its side: it rolls with the pointer, up and down or across
+      const dx = this.heroMode && !this.tilesView
+        ? (e.clientY - drag.y + (e.clientX - drag.x) * 0.5) * u
+        : (e.clientX - drag.x) * u;
+      const dy = this.tilesView ? (e.clientY - drag.y) * u : 0;
       this.card.scrollTiles(dx, dy);
       // the speed it's let go at, smoothed over the last few moves
       drag.vx = drag.vx * 0.6 + (dx / dt) * 0.4;
@@ -2343,15 +2673,23 @@ export class HoloApp {
       this.tileDrag = null;
       // a pause before letting go: no glide
       const still = performance.now() - drag.t > 80;
-      this.card.holdTiles(false, still ? 0 : drag.vx, still ? 0 : drag.vy);
+      // a flicked Rolodex glides on, but never faster than a turn or so a second
+      const vx = this.tilesView ? drag.vx : THREE.MathUtils.clamp(drag.vx, -ROLODEX_MAX_SPIN, ROLODEX_MAX_SPIN);
+      this.card.holdTiles(false, still ? 0 : vx, still ? 0 : drag.vy);
       if (this.renderer.domElement.hasPointerCapture(e.pointerId)) this.renderer.domElement.releasePointerCapture(e.pointerId);
     }
     const click = this.plateClick;
     if (click && e.pointerId === click.id) {
       this.plateClick = null;
-      if (Math.hypot(e.clientX - click.x, e.clientY - click.y) < 6) {
-        if (click.plate !== null) this.focusPlate(click.plate);
-        else if (this.card.focusedPlate !== null) this.focusPlate(null);
+      if (this.heroMode && Math.hypot(e.clientX - click.x, e.clientY - click.y) < 6) {
+        this.onPageTap?.();
+      } else if (Math.hypot(e.clientX - click.x, e.clientY - click.y) < 6) {
+        const out = this.card.focusedPlate;
+        // with a card out, a click anywhere off it just puts it back — it
+        // never swaps to another card (the arrow keys step between them)
+        if (out !== null) {
+          if (click.plate !== out) this.focusPlate(null);
+        } else if (click.plate !== null) this.focusPlate(click.plate);
       }
     }
     if (this.cardDragId !== null && e.pointerId === this.cardDragId) {
@@ -2431,15 +2769,30 @@ export class HoloApp {
     return (2 * TILE_RADIUS * half) / Math.max(1, this.host.clientHeight);
   }
 
-  /** Ease the camera to a view: Helix from low at three-quarters, Tiles straight on. */
+  /**
+   * Ease the camera to a view: the stack from low at three-quarters, Tiles
+   * from inside its drum, Front square on to the card (making a ticket).
+   */
   frameView(view: string) {
     const tiles = view === 'Tiles';
     const to = tiles ? TILES_VIEW : DEFAULT_VIEW;
+    const camera = new THREE.Vector3(...to.camera), target = new THREE.Vector3(...to.target);
+    if (view === 'Front') {
+      // facing the card, which fills a little over half the height: room for the console below
+      const half = Math.tan(THREE.MathUtils.degToRad(LENS_FOV) / 2);
+      // a little to the right, so the engraver's monitor beside it is in view too
+      camera.set(FRONT_SHIFT, 0, this.card.dims.h / 2 / half / FRONT_FILL);
+      target.set(FRONT_SHIFT, 0, 0);
+    }
     this.camMove = {
       from: [this.camera.position.clone(), this.controls.target.clone(), this.camera.fov],
-      to: [new THREE.Vector3(...to.camera), new THREE.Vector3(...to.target), tiles ? TILES_VIEW.fov : LENS_FOV],
+      to: [camera, target, tiles ? TILES_VIEW.fov : LENS_FOV],
       k: 0,
     };
+    // drop any orbit still gliding: it would wait out the move, then push the camera off the view
+    const glide = this.controls as unknown as { _sphericalDelta?: THREE.Spherical; _panOffset?: THREE.Vector3 };
+    glide._sphericalDelta?.set(0, 0, 0);
+    glide._panOffset?.set(0, 0, 0);
   }
 
   private onResize() {
@@ -2450,6 +2803,9 @@ export class HoloApp {
     this.applyViewInset(width, height);
     this.renderer.setSize(width, height);
     this.composer.setSize(width, height);
+    // a resize clears the canvas: draw straight away, or a canvas resized
+    // every frame (opened full screen from a page) shows blank between frames
+    if (this.revealed) this.composer.render();
   }
 
   /**
@@ -2458,8 +2814,23 @@ export class HoloApp {
    * open canvas. Hidden or collapsed, the panel takes no room.
    */
   private applyViewInset(width = this.host.clientWidth, height = this.host.clientHeight) {
-    if (this.viewInset > 0) this.camera.setViewOffset(width, height, this.viewInset / 2, 0, width, height);
-    else this.camera.clearViewOffset();
+    const f = this.pageFrame;
+    const z = this.heroMode ? this.heroZoom : 1;
+    // still in its place in the page (the frame is its own size, zoomed), it's drawn as there
+    const small = !f || (Math.abs(width * z - f.w) <= 2 && Math.abs(height * z - f.h) <= 2);
+    if (f && !small) {
+      // drawn as if into the page's frame: the canvas is bigger, and shows the scene there
+      this.camera.aspect = f.w / f.h;
+      this.camera.setViewOffset(f.w, f.h, -f.x, -f.y, width, height);
+    } else if (z !== 1) {
+      // in the page, closer in: the middle of a canvas z times the size
+      this.camera.aspect = width / height;
+      this.camera.setViewOffset(width * z, height * z, ((z - 1) * width) / 2, ((z - 1) * height) / 2, width, height);
+    } else {
+      this.camera.aspect = width / height;
+      if (this.viewInset > 0) this.camera.setViewOffset(width, height, this.viewInset / 2, 0, width, height);
+      else this.camera.clearViewOffset();
+    }
     this.camera.updateProjectionMatrix();
   }
 
@@ -2520,16 +2891,50 @@ export class HoloApp {
 
     if (this.cine) this.runCinematic();
     if (this.cardMode) this.card.update(dt, this.elapsed);
+    // the titles stand either side of the stack, out of the way of a ticket, the wall or a card being shown
+    this.titleInk.set(this.background.getHSL({ h: 0, s: 0, l: 0 }).l < 0.5 ? '#e8e6e1' : '#1a1a1a');
+    this.card.setOutlineInk(this.titleInk, this.background);
+    // the reel shows the stack as it is: its cards in place at once, never flying in
+    this.card.setInstantPlates(!!this.cine);
+    // and on the wall it scrolls slowly on, so new cards keep coming in under the camera
+    if (this.cine && this.tilesView) this.card.scrollTiles(0, TILE_CINE_SCROLL * dt);
+    // the first time the stack's in view, it opens: outlines drawn in, then the cards over them
+    if (!this.opened && this.revealed && this.cardMode && this.card.stacked && !this.ticketing) {
+      this.opened = true;
+      this.card.beginIntro();
+    }
+    this.titles.update(
+      dt,
+      this.camera,
+      this.controls.target,
+      this.revealed && !this.titlesHeld && this.cardMode && this.card.stacked && !this.ticketing && !this.tilesView && this.card.focusedPlate === null && !this.cine,
+      this.titleInk,
+    );
     if (this.camMove) {
       const m = this.camMove;
       m.k = Math.min(1, m.k + dt / 1.2);
       const e = m.k < 0.5 ? 4 * m.k ** 3 : 1 - (-2 * m.k + 2) ** 3 / 2;
-      this.camera.position.lerpVectors(m.from[0], m.to[0], e);
+      // round the formation, not through it: the direction from its middle
+      // swings across while the distance eases, so the camera never cuts
+      // through the cards on its way between views
+      const r0 = m.from[0].length(), r1 = m.to[0].length();
+      camQ.setFromUnitVectors(camU0.copy(m.from[0]).normalize(), camU1.copy(m.to[0]).normalize());
+      camQe.slerpQuaternions(IDENTITY_Q, camQ, e);
+      this.camera.position.copy(camU0).applyQuaternion(camQe).multiplyScalar(THREE.MathUtils.lerp(r0, r1, e));
       this.controls.target.lerpVectors(m.from[1], m.to[1], e);
       this.camera.up.set(0, 1, 0);
       this.camera.lookAt(this.controls.target);
       this.camera.fov = THREE.MathUtils.lerp(m.from[2], m.to[2], e);
       this.camera.updateProjectionMatrix();
+      // a plate pulled out mid-move (Print shows the new ticket while the view is
+      // still easing home): the pose it goes back to is where this move is going,
+      // not where the camera was when the plate came out
+      const rest = this.plateCam.rest;
+      if (rest) {
+        rest.position.copy(this.camera.position);
+        rest.target.copy(this.controls.target);
+        rest.up.set(0, 1, 0);
+      }
       if (m.k >= 1) this.camMove = null;
     }
     // the laser waits for the stack to fold down to the one card, then cuts a pass per stage
@@ -2539,19 +2944,23 @@ export class HoloApp {
       if (this.etch < 1) {
         const head = headAt(plan, this.etch);
         this.card.setLaser(this.etch, head, this.elapsed);
+        this.showOnMonitor();
         if (this.elapsed - this.laserReported > 0.07) {
           this.laserReported = this.elapsed;
-          this.onLaser?.({ pass: this.etchPass, passes: this.etchStages.length, progress: this.etch, u: head.u, v: head.v, firing: head.firing });
+          this.onLaser?.({ pass: this.etchPass, passes: this.etchPasses, progress: this.etch, u: head.u, v: head.v, firing: head.firing });
         }
-      } else if (this.etchPass + 1 < this.etchStages.length) {
-        this.etchPass++;
-        this.startPass();
       } else {
-        this.etch = null;
-        this.card.setLaser(null);
-        // cut through: the owner's letters open right through the card
-        this.setLettering(true, true);
-        this.onLaser?.(null);
+        // the name cut: the owner's letters open right through the card
+        if (this.etchPass === LETTER_PASSES - 1) {
+          this.setLettering(true, true);
+          this.lettersCut = true;
+        }
+        if (this.etchPass + 1 < this.etchPasses && !(this.letterOnly && this.etchPass === LETTER_PASSES - 1)) {
+          this.etchPass++;
+          this.startPass();
+        } else {
+          this.finishEtch();
+        }
       }
     }
     if (this.params && !this.cardMode) {
@@ -2615,18 +3024,35 @@ export class HoloApp {
       this.controls.enabled = false;
       // the wall's rows come and go as it scrolls: their tickets with them
       this.assignPlates();
+    } else if (this.params?.stack?.shape === 'Helix' && this.card.stacked && !this.ticketing) {
+      // the endless Helix: cards coming back round take the next tickets
+      this.assignPlates();
     }
     this.updateVeil(dt);
+    // a card out of the Helix: the rest of it steps aside, to the viewer's left
+    if (this.card.focusedPlate !== null) {
+      asideDir.setFromMatrixColumn(this.camera.matrixWorld, 0).multiplyScalar(-HELIX_ASIDE);
+      this.card.setAside(asideDir);
+    }
     // Tiles is lit up, easing in and out with the view
     this.viewLight += ((this.tilesView ? TILES_LIGHT : 1) - this.viewLight) * (1 - Math.exp(-3 * dt));
     if (this.params && !this.cine) {
-      this.renderer.toneMappingExposure = this.params.render.exposure * this.viewLight;
-      this.scene.environmentIntensity = this.params.render.environment * this.viewLight;
+      // turned up on the wall — but a Field room already lights it brightly,
+      // and its colour should read the same on the wall as on the stack
+      const lift = isFieldRoom(this.lighting.current) ? 1 : this.viewLight;
+      this.renderer.toneMappingExposure = this.params.render.exposure * lift;
+      this.scene.environmentIntensity = this.params.render.environment * lift;
       // and its light comes from higher: the room tipped so the bright band
       // the wall reflects rides up toward its top, not across its middle
-      const tip = ((this.viewLight - 1) / (TILES_LIGHT - 1)) * TILES_LIGHT_TIP;
+      const k = (this.viewLight - 1) / (TILES_LIGHT - 1);
+      const tip = k * TILES_LIGHT_TIP;
       this.scene.environmentRotation.x = tip;
       this.lightRig.rotation.x = tip;
+      // and turned round for the wall: the angle the Light Angle slider sets, plus the wall's own
+      const turn = THREE.MathUtils.degToRad(this.params.render.lightAngle ?? 0) + k * TILES_LIGHT_TURN;
+      this.scene.environmentRotation.y = turn;
+      this.lightRig.rotation.y = turn;
+
     }
     if (!this.cine && this.plateCam.k === 0 && !this.camMove) this.controls.update();
     this.composer.render();

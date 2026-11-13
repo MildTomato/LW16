@@ -3,18 +3,22 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Holocloth</title>
-    <meta name="description" content="A holographic cloth to hang as a poster, fly as a flag and cover in stickers." />
+    <title>Launch Week 16 | Supabase</title>
+    <meta name="description" content="Make your own Launch Week 16 ticket. Design it, watch the laser burn it, and add it to everyone else's." />
     <meta property="og:type" content="website" />
     <meta property="og:url" content="https://holocloth-lilac.vercel.app/" />
-    <meta property="og:title" content="Holocloth" />
-    <meta property="og:description" content="A holographic cloth to hang as a poster, fly as a flag and cover in stickers." />
-    <meta property="og:image" content="https://holocloth-lilac.vercel.app/og.jpg" />
+    <meta property="og:title" content="Launch Week 16" />
+    <meta property="og:description" content="Make your own Launch Week 16 ticket. Design it, watch the laser burn it, and add it to everyone else's." />
+    <meta property="og:image" content="https://holocloth-lilac.vercel.app/og.jpg?v=lw16" />
     <meta property="og:image:width" content="1200" />
     <meta property="og:image:height" content="630" />
+    <meta property="og:image:alt" content="A Rolodex of laser-etched Launch Week 16 tickets" />
+    <meta property="og:site_name" content="Supabase" />
     <meta name="twitter:card" content="summary_large_image" />
-    <meta name="twitter:title" content="Holocloth" />
-    <meta name="twitter:image" content="https://holocloth-lilac.vercel.app/og.jpg" />
+    <meta name="twitter:title" content="Launch Week 16" />
+    <meta name="twitter:site" content="@supabase" />
+    <meta name="twitter:description" content="Make your own Launch Week 16 ticket. Design it, watch the laser burn it, and add it to everyone else's." />
+    <meta name="twitter:image" content="https://holocloth-lilac.vercel.app/og.jpg?v=lw16" />
     <style>
       html, body {
         margin: 0;
@@ -35,6 +39,44 @@
       #canvas-host canvas {
         display: block;
         touch-action: none;
+      }
+      /* a rounded button: filled a shade off the page with an ink outline, filled with ink on hover, pressed in when held */
+      .pill {
+        color: var(--ink);
+        background: var(--paper);
+        transition: background-color 0.15s ease, color 0.15s ease, scale 0.1s ease;
+      }
+      .pill:hover {
+        background: var(--ink);
+        color: var(--paper);
+      }
+      .pill:active:not(:disabled) {
+        scale: 0.95;
+      }
+      /* the main action: filled with ink, lifting to the page's fill on hover */
+      .pill.primary {
+        background: var(--ink);
+        color: var(--paper);
+      }
+      .pill.primary:hover {
+        background: var(--paper);
+        color: var(--ink);
+      }
+      .pill:disabled {
+        opacity: 0.35;
+        cursor: default;
+      }
+      .pill:disabled:hover {
+        background: var(--paper);
+        color: var(--ink);
+      }
+      .pill.primary:disabled:hover {
+        background: var(--ink);
+        color: var(--paper);
+      }
+      .pill:focus-visible {
+        outline: 2px solid var(--ink);
+        outline-offset: 3px;
       }
       /* the ticket console's type: Geist Pixel for what you make, Geist Mono for the machine */
       @font-face {

@@ -1,11 +1,23 @@
 import * as THREE from 'three';
-import { MAX_PLATES, StackAnimator, type StackParams } from './cardStack.ts';
+import { Line2 } from 'three/examples/jsm/lines/Line2.js';
+import { LineGeometry } from 'three/examples/jsm/lines/LineGeometry.js';
+import { LineMaterial } from 'three/examples/jsm/lines/LineMaterial.js';
+import { MAX_PLATES, StackAnimator, helixFade, helixLap, type StackParams } from './cardStack.ts';
+import { Monitor } from './monitor.ts';
 
 /** thin, like a die-cut metal ticket */
 const THICKNESS = 0.02;
 const plateM = new THREE.Matrix4();
 /** the printed face sits a hair proud of the slab, so the two never z-fight */
 const FACE_LIFT = 0.0004;
+/** the engraver: how far in front of the face its module floats, and its nozzle's length */
+const GANTRY_GAP = 0.42;
+const GANTRY_NOZZLE = 0.09;
+/** the floating laser module's size */
+const GANTRY_HEAD_SCALE = 1.7;
+/** how far above it starts, and how long it takes to float down into place */
+const GANTRY_DROP = 7;
+const GANTRY_ARRIVE = 1.1;
 const CORNER_SEGMENTS = 10;
 /** a small 45° chamfer where face meets side: the facet that glints as the card turns */
 const CHAMFER = 0.006;
@@ -43,6 +55,95 @@ function cardOutline(width: number, height: number, radius: number) {
   return s;
 }
 
+/**
+ * A laser warning sticker, drawn: the yellow triangle with the beam's
+ * starburst; the label with it and WARNING / LASER RADIATION; or a strip
+ * of black and yellow hazard stripes.
+ */
+function warningSticker(kind: 'triangle' | 'label' | 'strip') {
+  const yellow = '#f4c20d', black = '#151515';
+  const c = document.createElement('canvas');
+  const [w, h] = kind === 'triangle' ? [256, 256] : kind === 'label' ? [512, 272] : [64, 768];
+  c.width = w;
+  c.height = h;
+  const g = c.getContext('2d')!;
+  // the laser symbol: a triangle with a starburst, its beam out to the right
+  const triangle = (cx: number, cy: number, s: number) => {
+    g.beginPath();
+    g.moveTo(cx, cy - s * 0.55);
+    g.lineTo(cx + s * 0.6, cy + s * 0.48);
+    g.lineTo(cx - s * 0.6, cy + s * 0.48);
+    g.closePath();
+    g.fillStyle = yellow;
+    g.fill();
+    g.lineJoin = 'round';
+    g.lineWidth = s * 0.09;
+    g.strokeStyle = black;
+    g.stroke();
+    const ox = cx - s * 0.12, oy = cy + s * 0.14;
+    g.fillStyle = black;
+    g.beginPath();
+    g.arc(ox, oy, s * 0.06, 0, Math.PI * 2);
+    g.fill();
+    g.lineWidth = s * 0.028;
+    for (let k = 0; k < 12; k++) {
+      const a = (k / 12) * Math.PI * 2;
+      const r0 = s * 0.09, r1 = s * (k % 2 ? 0.15 : 0.2);
+      g.beginPath();
+      g.moveTo(ox + Math.cos(a) * r0, oy + Math.sin(a) * r0);
+      g.lineTo(ox + Math.cos(a) * r1, oy + Math.sin(a) * r1);
+      g.stroke();
+    }
+    g.lineWidth = s * 0.04;
+    g.beginPath();
+    g.moveTo(ox + s * 0.08, oy);
+    g.lineTo(cx + s * 0.38, oy);
+    g.stroke();
+  };
+  if (kind === 'triangle') {
+    triangle(w / 2, h / 2 + 8, 220);
+  } else if (kind === 'label') {
+    g.fillStyle = yellow;
+    g.fillRect(0, 0, w, h);
+    g.lineWidth = 10;
+    g.strokeStyle = black;
+    g.strokeRect(5, 5, w - 10, h - 10);
+    // the black band across the top with WARNING in it
+    g.fillStyle = black;
+    g.fillRect(0, 0, w, 84);
+    g.fillStyle = yellow;
+    g.font = "700 60px 'Geist Mono', ui-monospace, monospace";
+    g.textBaseline = 'middle';
+    g.textAlign = 'center';
+    g.fillText('WARNING', w / 2, 46);
+    triangle(96, 182, 150);
+    g.fillStyle = black;
+    g.textAlign = 'left';
+    g.font = "700 54px 'Geist Mono', ui-monospace, monospace";
+    g.fillText('LASER', 196, 152);
+    g.font = "500 27px 'Geist Mono', ui-monospace, monospace";
+    g.fillText('AVOID EXPOSURE', 196, 204);
+    g.fillText('CLASS 4 BEAM', 196, 238);
+  } else {
+    g.fillStyle = yellow;
+    g.fillRect(0, 0, w, h);
+    g.fillStyle = black;
+    for (let y = -w; y < h + w; y += 64) {
+      g.beginPath();
+      g.moveTo(0, y);
+      g.lineTo(w, y + w);
+      g.lineTo(w, y + w + 32);
+      g.lineTo(0, y + 32);
+      g.closePath();
+      g.fill();
+    }
+  }
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.anisotropy = 4;
+  return tex;
+}
+
 /** radians of spin per pixel dragged */
 const SPIN_PER_PX = 0.008;
 /** fastest spin a flick can give it, rad/s — a lively few turns, not a blur */
@@ -78,6 +179,10 @@ export class MetalCard {
   /** a different artwork per plate, cycled through the stack; none = the card's */
   /** each plate's layer of the plate art: plates show any ticket in the pool, not just their own index */
   private plateLayer = new THREE.InstancedBufferAttribute(new Float32Array(MAX_PLATES).map((_, i) => i), 1);
+  /** how much of each plate shows (1 all, 0 none): the endless Helix's ends fade into the background */
+  private plateFade = new THREE.InstancedBufferAttribute(new Float32Array(MAX_PLATES).fill(1), 1);
+  /** the background a fading plate fades into */
+  private fadeU = { uFadeBg: { value: new THREE.Color() } };
   private plateArt = {
     uPlateArt: { value: null as THREE.DataArrayTexture | null },
     /** the page's marks on every ticket plate (null: none) */
@@ -93,6 +198,15 @@ export class MetalCard {
   private edge: THREE.MeshPhysicalMaterial;
   private size = { w: 2, h: 3 };
   private corner = 0.04;
+  /** the opening: a hairline outline per plate, drawn in before the plate comes in over it */
+  private introLines: Line2[] = [];
+  /** and its fill, a tint of the page, coming in as the outline closes */
+  private introFills: THREE.Mesh<THREE.ShapeGeometry, THREE.MeshBasicMaterial>[] = [];
+  private outlineShape: THREE.Shape | null = null;
+  private outlinePoints: THREE.Vector2[] = [];
+  private outlineInk = new THREE.Color('#1a1a1a');
+  private outlineFill = new THREE.Color('#e6e4df');
+  private outlinePaper = new THREE.Color('#e8e6e1');
   private backMirror = false;
   private bump = 0;
   private stickerMap: { value: THREE.Texture };
@@ -104,6 +218,12 @@ export class MetalCard {
     uMapTexel: { value: new THREE.Vector2(1 / 2048, 1 / 3072) },
     /** a ticket's owner (username and number): 0 ink, 1 mirror, 2 etched; and the ink's colour */
     uOwnerFinish: { value: 0 },
+    /** how light an etched groove's floor is: darker when the room colours plain metal, so the linework reads */
+    uGrooveTone: { value: 0.55 },
+    /** a holographic foil over the face: rainbow bands set by the angle it's seen at */
+    uFoil: { value: 0 },
+    /** the Tiles wall shaded as one smooth curve (1), or each card flat (0) */
+    uTileCurve: { value: 0 },
     uOwnerInk: { value: new THREE.Color(0.025, 0.025, 0.025) },
   };
   /** the laser etching the face: on, and how far through (0..1) */
@@ -130,6 +250,22 @@ export class MetalCard {
   };
   /** the laser itself: a beam down onto the face, its spot, and the light it throws */
   private laser = new THREE.Group();
+  /**
+   * The engraver: a laser module floating in front of the face, moving over
+   * it as it cuts, the beam firing from its nozzle. (Its beam and head groups
+   * carry the y and x of the cut; there's no frame.)
+   */
+  private gantry = new THREE.Group();
+  private gantryBeam = new THREE.Group();
+  private gantryHead = new THREE.Group();
+  /** and its monitor, to the right, where the layers are designed */
+  readonly monitor = new Monitor();
+  /** wanted (making a ticket), and how far it's come down into place (0..1) */
+  private gantryWanted = false;
+  private gantryK = 0;
+  /** where the head is going (the card's uv), and where it is */
+  private headGoal = new THREE.Vector2(0, 1);
+  private headAt = new THREE.Vector2(0, 1);
   private laserLight = new THREE.PointLight('#ff8a3d', 0, 0.9, 2);
   private rot = { x: 0, y: 0 };
   /** an exact angle (and offset) held by the cinematic reel; null = spin and settle */
@@ -158,7 +294,10 @@ export class MetalCard {
     this.front.polygonOffsetUnits = -4;
     // the plates' face: the same, but each plate can carry its own artwork
     this.plateFront = this.front.clone();
-    this.plateFront.onBeforeCompile = (shader) => this.patchFace(shader, true);
+    this.plateFront.onBeforeCompile = (shader) => {
+      this.patchFace(shader, true);
+      this.patchFade(shader);
+    };
     this.plateFront.customProgramCacheKey = () => 'card-plates';
     const metal = (this.metal = new THREE.MeshPhysicalMaterial({
       color: '#c3c8cf',
@@ -178,6 +317,7 @@ export class MetalCard {
       clearcoat: 0.2,
       clearcoatRoughness: 0.15,
     });
+    this.edge.onBeforeCompile = (shader) => this.patchFade(shader);
     // extrude groups: 0 = the two caps (metal), 1 = the sides (edge)
     this.slab = new THREE.Mesh(new THREE.ExtrudeGeometry(), [metal, this.edge]);
     this.face = new THREE.Mesh(new THREE.ShapeGeometry(), this.front);
@@ -185,6 +325,8 @@ export class MetalCard {
     this.stackFace = new THREE.InstancedMesh(this.face.geometry, this.plateFront, MAX_PLATES);
     this.slab.geometry.setAttribute('aPlateLayer', this.plateLayer);
     this.face.geometry.setAttribute('aPlateLayer', this.plateLayer);
+    this.slab.geometry.setAttribute('aPlateFade', this.plateFade);
+    this.face.geometry.setAttribute('aPlateFade', this.plateFade);
     for (const m of [this.stackSlab, this.stackFace]) {
       m.count = 0;
       m.visible = false;
@@ -193,6 +335,7 @@ export class MetalCard {
     }
     this.group.add(this.slab, this.face, this.stackSlab, this.stackFace);
     this.buildLaser();
+    this.buildGantry();
     this.group.add(this.laser);
     this.group.visible = false;
     this.rebuild();
@@ -234,6 +377,15 @@ export class MetalCard {
   private rebuild() {
     const { w, h } = this.size;
     const outline = cardOutline(w, h, this.corner);
+    // the opening's outlines follow the card's shape: start again from it
+    this.outlinePoints = outline.getPoints(CORNER_SEGMENTS);
+    this.outlinePoints.push(this.outlinePoints[0].clone());
+    for (const line of this.introLines) line.geometry.setPositions(this.outlinePositions());
+    this.outlineShape = outline;
+    for (const fill of this.introFills) {
+      fill.geometry.dispose();
+      fill.geometry = new THREE.ShapeGeometry(outline, CORNER_SEGMENTS);
+    }
     // the slab: straight sides with a one-step chamfer at each face, centred
     // on z. The negative offset keeps the sides on the outline, so the
     // chamfer cuts inward and the card stays its full size.
@@ -266,6 +418,8 @@ export class MetalCard {
       this.stackFace.geometry = face;
       slab.setAttribute('aPlateLayer', this.plateLayer);
       face.setAttribute('aPlateLayer', this.plateLayer);
+      slab.setAttribute('aPlateFade', this.plateFade);
+      face.setAttribute('aPlateFade', this.plateFade);
     }
   }
 
@@ -357,9 +511,14 @@ export class MetalCard {
     normal.set(0, 0, 1).transformDirection(plateM);
   }
 
-  /** Plate i's middle, in world space, as it is now. */
+  /** Plate i's middle, in world space, where it rests in the formation. */
   plateCentre(i: number, out: THREE.Vector3) {
-    this.stackSlab.getMatrixAt(i, plateM);
+    // its place in the formation, not where it's drawn now: a plate still on
+    // its way in (from out of view) is wanted where it'll land. A plate new
+    // this frame has no place worked out yet: where it's drawn will do
+    const rest = this.stack.restMatrix(i);
+    if (rest) plateM.copy(rest);
+    else this.stackSlab.getMatrixAt(i, plateM);
     plateM.premultiply(this.group.matrixWorld);
     return out.setFromMatrixPosition(plateM);
   }
@@ -451,6 +610,35 @@ export class MetalCard {
       .replace('#include <clipping_planes_fragment>', `#include <clipping_planes_fragment>
         // only the flat front and back: the sides stay whole
         if (vCap > 0.9 && slabCut() > 0.5) discard;`);
+    this.patchFade(shader);
+  }
+
+  /** The endless Helix's plates fade out at one end and back in at the other; in any other formation they all show. */
+  private updatePlateFade() {
+    const helix = this.stackParams.shape === 'Helix' && this.stack.shapeNow === 'Helix';
+    const n = this.stackParams.count;
+    const a = this.plateFade.array as Float32Array;
+    let changed = false;
+    for (let i = 0; i < n; i++) {
+      const k = helix ? helixFade(i, n, this.stackParams.twist, this.stack.flowPhase, this.stack.scrollX) : 1;
+      if (Math.abs(a[i] - k) > 1e-4) {
+        a[i] = k;
+        changed = true;
+      }
+    }
+    if (changed) this.plateFade.needsUpdate = true;
+  }
+
+  /** A stack plate fades into the background as its fade drops (the endless Helix's ends). */
+  private patchFade(shader: THREE.WebGLProgramParametersWithUniforms) {
+    if (!shader.instancing) return;
+    Object.assign(shader.uniforms, this.fadeU);
+    shader.vertexShader = shader.vertexShader
+      .replace('#include <common>', '#include <common>\nattribute float aPlateFade;\nvarying float vPlateFade;')
+      .replace('#include <begin_vertex>', '#include <begin_vertex>\nvPlateFade = aPlateFade;');
+    shader.fragmentShader = shader.fragmentShader
+      .replace('#include <common>', '#include <common>\nvarying float vPlateFade;\nuniform vec3 uFadeBg;')
+      .replace('#include <dithering_fragment>', '#include <dithering_fragment>\ngl_FragColor.rgb = mix(uFadeBg, gl_FragColor.rgb, vPlateFade);');
   }
 
   private patchFace(shader: THREE.WebGLProgramParametersWithUniforms, plates: boolean) {
@@ -458,8 +646,8 @@ export class MetalCard {
     if (plates) {
       // each plate's own artwork: a layer of the texture array, the plate's slot in the pool
       shader.vertexShader = shader.vertexShader
-        .replace('#include <common>', '#include <common>\nattribute float aPlateLayer;\nflat varying float vPlate;')
-        .replace('#include <begin_vertex>', '#include <begin_vertex>\nvPlate = aPlateLayer;');
+        .replace('#include <common>', '#include <common>\nattribute float aPlateLayer;\nflat varying float vPlate;\nvarying vec3 vDrumPos;')
+        .replace('#include <begin_vertex>', '#include <begin_vertex>\nvPlate = aPlateLayer;\nvDrumPos = (modelMatrix * instanceMatrix * vec4(transformed, 1.0)).xyz;');
     }
     // helpers go after map_pars_fragment, where the artwork's map sampler is declared
     shader.fragmentShader = shader.fragmentShader.replace('#include <map_pars_fragment>', /* glsl */ `#include <map_pars_fragment>
@@ -468,6 +656,8 @@ export class MetalCard {
       uniform float uEtchDepth;
       uniform float uEtchBevel;  // groove shoulder width, in artwork texels
       uniform vec2 uMapTexel;
+      uniform float uGrooveTone;
+      uniform float uFoil;
       uniform float uOwnerFinish; // the owner: 0 ink, 1 mirror, 2 etched
       uniform vec3 uOwnerInk;     // and the ink's colour
       ${plates ? `
@@ -498,12 +688,25 @@ export class MetalCard {
       // a plate's artwork is already cut out under its lettering (when the plate is made)
       float cardKeepClear(vec2 uv) { return 0.0; }
       vec3 cardPlainGround(vec2 uv) { return cardArt(uv).rgb; }
+      // the Tiles wall shaded as one smooth curve: each point catches light as
+      // the drum's curve would there, not as its flat card does — so light
+      // sweeps across neighbouring cards in one band
+      varying vec3 vDrumPos;
+      uniform float uTileCurve;
+      // the surface's own detail (scratches, the etch) kept: the flat card's
+      // facing is swapped for the curve's, and the detail rides on top
+      vec3 cardSurfaceNormal(vec3 n, vec3 cardFlat) {
+        if (uTileCurve < 0.5) return n;
+        vec3 inward = normalize((viewMatrix * vec4(normalize(vec3(-vDrumPos.x, 0.0, -vDrumPos.z)), 0.0)).xyz);
+        return dot(inward, cardFlat) > 0.0 ? normalize(n - cardFlat + inward) : n;
+      }
       // plates are never mid-etch
       float cardReveal(vec2 uv) { return 1.0; }
       vec3 cardLaserGlow(vec2 uv, float ink) { return vec3(0.0); }
       ` : `
       vec4 cardArt(vec2 uv) { return texture2D(map, uv); }
       vec2 cardTexel() { return uMapTexel; }
+      vec3 cardSurfaceNormal(vec3 n, vec3 cardFlat) { return n; }
 
       // the laser: it rasters the face row by row, back and forth, cutting
       // only the runs of new ink in each row and skipping the gaps
@@ -582,6 +785,16 @@ export class MetalCard {
         // under the lettering: the ground, without the linework
         cardColor.rgb = mix(cardColor.rgb, cardPlainGround(vMapUv), cardKeepClear(vMapUv));
         diffuseColor *= cardColor;
+        // holographic foil: a diffraction grating's rainbow, its hue set by
+        // the angle between the viewer and the face, banded across it — so it
+        // rolls over the card as it turns, or as the wall is dragged
+        if (uFoil > 0.5) {
+          vec3 foilV = normalize(vViewPosition);
+          vec3 foilR = reflect(-foilV, normalize(vNormal));
+          float foilHue = fract(foilR.x * 0.9 + foilR.y * 0.6 + (vMapUv.x * 0.7 + vMapUv.y * 1.3) * 1.6);
+          vec3 foil = 0.5 + 0.5 * cos(6.2832 * (foilHue + vec3(0.0, 0.33, 0.67)));
+          diffuseColor.rgb *= 0.25 + 0.85 * foil;
+        }
         float cardSticker = 0.0;
         // the owner as its own material: ink or mirror (etched, it's part of the linework)
         float cardOwner = uOwnerFinish < 1.5 ? cardOwnerAt(vMapUv) : 0.0;
@@ -607,7 +820,7 @@ export class MetalCard {
           // shadowed inside the cut so each line reads as one line
           if (cardBare) {
             float shade = 1.0 - 0.55 * cardEtchH * clamp(uEtchDepth * 1.5, 0.0, 1.0);
-            diffuseColor.rgb = mix(diffuseColor.rgb, vec3(0.55, 0.56, 0.6) * shade, cardInk);
+            diffuseColor.rgb = mix(diffuseColor.rgb, vec3(1.0, 1.02, 1.09) * uGrooveTone * shade, cardInk);
           }
           // the owner over the artwork: matte black ink, or a bright mirror polish
           diffuseColor.rgb = mix(diffuseColor.rgb, uOwnerInk, cardOwnerInk);
@@ -631,6 +844,7 @@ export class MetalCard {
         metalnessFactor = mix(metalnessFactor, 1.0, cardOwnerMirror);`)
       // the groove: its shoulders bend the light, so the cut catches it as the card turns
       .replace('#include <normal_fragment_maps>', `#include <normal_fragment_maps>
+        normal = cardSurfaceNormal(normal, nonPerturbedNormal);
         if (cardEtched && uEtchDepth > 0.0) {
           // a cut: height falls into the ink, so the slope points out of it
           vec2 dHduv = -cardEtchGrad * uEtchDepth * 0.08 * (1.0 - cardSticker);
@@ -640,6 +854,8 @@ export class MetalCard {
         totalEmissiveRadiance += cardLaserGlow(vMapUv, cardInk);
         // polished letters never go dull: a faint lift under the shine
         totalEmissiveRadiance += vec3(0.1) * cardOwnerMirror;`)
+      .replace('#include <clearcoat_normal_fragment_begin>', `#include <clearcoat_normal_fragment_begin>
+        clearcoatNormal = cardSurfaceNormal(clearcoatNormal, nonPerturbedNormal);`)
       .replace('#include <lights_physical_fragment>', `#include <lights_physical_fragment>
         #ifdef USE_IRIDESCENCE
           material.iridescence *= 1.0 - max(max(cardInk, cardSticker), cardOwner);
@@ -668,6 +884,18 @@ export class MetalCard {
   /** Tiles: turn and scroll the wall by (dx, dy) in the stack's units; hold it while dragging, or let it glide on at (vx, vy). */
   scrollTiles(dx: number, dy: number) {
     this.stack.scrollBy(dx, dy);
+  }
+
+  /** Where the rest of the Helix steps aside to while a card's out: a world direction and distance. */
+  setAside(world: THREE.Vector3) {
+    const local = world.clone().applyQuaternion(this.group.getWorldQuaternion(new THREE.Quaternion()).invert());
+    this.stack.setAside(local.x, local.y, local.z);
+  }
+
+  /** how many times Helix plate i has gone round its endless spiral */
+  helixLap(i: number) {
+    const n = this.stackParams.count;
+    return helixLap(i, n, this.stackParams.twist, this.stack.flowPhase, this.stack.scrollX);
   }
 
   /** Tiles: how far the wall's been scrolled */
@@ -719,6 +947,21 @@ export class MetalCard {
    * frosted plate) or filled with matte black. Depth 0..1; bevel is the
    * groove's shoulder width in artwork texels.
    */
+  /** Shade the stack as the Tiles drum's one smooth curve (on), or each plate as itself. */
+  setTileCurve(on: boolean) {
+    this.etch.uTileCurve.value = on ? 1 : 0;
+  }
+
+  /** A holographic foil over the face (on), or none. */
+  setFoil(on: boolean) {
+    this.etch.uFoil.value = on ? 1 : 0;
+  }
+
+  /** How light the etched grooves are: the usual pale silver, or darker on plain metal in a coloured room. */
+  setGrooveTone(tone: number) {
+    this.etch.uGrooveTone.value = tone;
+  }
+
   /** How a ticket's username and number are finished: polished Mirror, printed Ink, or Etched like the artwork. */
   setOwnerFinish(finish: string) {
     this.etch.uOwnerFinish.value = finish === 'Ink' ? 0 : finish === 'Etched' ? 2 : 1;
@@ -773,8 +1016,18 @@ export class MetalCard {
     this.edge.normalScale.set(strength, strength);
   }
 
+  /** Let go of any spin and settle front-on (the formation's own way round), not on the back. */
+  faceFront() {
+    this.vel = { x: 0, y: 0 };
+    this.homeFront = true;
+  }
+
+  /** settling to the front only, not whichever face is nearer: until the card's next dragged */
+  private homeFront = false;
+
   /** Spin by a pointer drag of (dx, dy) pixels over dt seconds. */
   drag(dx: number, dy: number, dt: number) {
+    this.homeFront = false;
     this.rot.y += dx * SPIN_PER_PX;
     this.rot.x += dy * SPIN_PER_PX;
     this.vel.y = THREE.MathUtils.clamp((dx * SPIN_PER_PX) / dt, -MAX_SPIN, MAX_SPIN);
@@ -787,6 +1040,8 @@ export class MetalCard {
     const beamGeo = new THREE.CylinderGeometry(0.0035, 0.0035, 1.4, 8, 1, true);
     beamGeo.rotateX(Math.PI / 2);
     beamGeo.translate(0, 0, 0.7);
+    // the beam runs from the face up to the gantry's nozzle, no further
+    beamGeo.scale(1, 1, (GANTRY_GAP - GANTRY_NOZZLE) / 1.4);
     const beam = new THREE.Mesh(beamGeo, new THREE.MeshBasicMaterial({ ...hot, opacity: 0.55 }));
     const spot = new THREE.Sprite(new THREE.SpriteMaterial({ ...hot, color: '#ffffff', map: glowTexture() }));
     spot.scale.setScalar(0.09);
@@ -794,6 +1049,106 @@ export class MetalCard {
     this.laser.add(beam, spot, this.laserLight);
     this.laserLight.position.z = 0.04;
     this.laser.visible = false;
+  }
+
+  private buildGantry() {
+    // anodised aluminium extrusion, black fittings, polished steel, and the laser's orange shield
+    const alu = new THREE.MeshStandardMaterial({ color: '#c3c7c9', metalness: 0.85, roughness: 0.32 });
+    const black = new THREE.MeshStandardMaterial({ color: '#191a1b', metalness: 0.35, roughness: 0.55 });
+    const steel = new THREE.MeshStandardMaterial({ color: '#e4e6e6', metalness: 1, roughness: 0.16 });
+    const shield = new THREE.MeshStandardMaterial({
+      color: '#ff7a1a',
+      metalness: 0,
+      roughness: 0.15,
+      transparent: true,
+      opacity: 0.55,
+      emissive: '#ff5a00',
+      emissiveIntensity: 0.25,
+      depthWrite: false,
+    });
+    const box = (x: number, y: number, z: number, mat: THREE.Material) => new THREE.Mesh(new THREE.BoxGeometry(x, y, z), mat);
+    const rod = (r: number, len: number, mat: THREE.Material) => new THREE.Mesh(new THREE.CylinderGeometry(r, r, len, 20), mat);
+    // the classic yellow warning stickers, printed on canvas
+    const stickers = { triangle: warningSticker('triangle'), label: warningSticker('label'), strip: warningSticker('strip') };
+    const sticker = (kind: keyof typeof stickers, w: number, h: number) =>
+      new THREE.Mesh(
+        new THREE.PlaneGeometry(w, h),
+        new THREE.MeshStandardMaterial({ map: stickers[kind], transparent: true, metalness: 0, roughness: 0.55 }),
+      );
+    this.gantry.name = 'gantry';
+    this.gantry.add(this.gantryBeam, this.monitor.group);
+    this.gantryBeam.add(this.gantryHead);
+    this.group.add(this.gantry);
+    this.layoutGantry = () => {
+      const { w, h } = this.size;
+      for (const g of [this.gantry, this.gantryBeam, this.gantryHead]) {
+        for (const c of [...g.children]) if (c !== this.gantryBeam && c !== this.gantryHead && c !== this.monitor.group) {
+          g.remove(c);
+          c.traverse((o) => (o as THREE.Mesh).geometry?.dispose());
+        }
+      }
+      // just the laser module, floating over the face: no frame, no rails
+      // the laser module: the finned body above the nozzle, the nozzle under
+      // its orange shield, right over the spot it's cutting
+      const body = box(0.11, 0.12, 0.09, black);
+      body.position.set(0, 0.075, 0.02);
+      const fins = new THREE.Group();
+      for (let k = 0; k < 6; k++) {
+        const fin = box(0.125, 0.006, 0.08, alu);
+        fin.position.set(0, 0.06 + k * 0.016, 0.02);
+        fins.add(fin);
+      }
+      const tri = sticker('triangle', 0.07, 0.07);
+      tri.position.set(0, 0.06, 0.066);
+      // the shield: a short orange cylinder round the nozzle, open to the face
+      const guard = new THREE.Mesh(new THREE.CylinderGeometry(0.035, 0.042, 0.06, 24, 1, true), shield);
+      guard.rotation.x = Math.PI / 2;
+      guard.position.z = -0.045;
+      const nozzle = rod(0.012, GANTRY_NOZZLE, steel);
+      nozzle.rotation.x = Math.PI / 2;
+      nozzle.position.z = -GANTRY_NOZZLE / 2 + 0.01;
+      // its label on top, and the shield's glow for a lamp
+      const label = sticker('label', 0.2, 0.105);
+      label.position.set(0, 0.21, 0.02);
+      this.gantryHead.add(body, fins, tri, guard, nozzle, label);
+      this.gantryHead.scale.setScalar(GANTRY_HEAD_SCALE);
+      this.gantryBeam.position.z = GANTRY_GAP;
+      this.gantryLamp = guard;
+      // the monitor stands off to the right, turned a little toward the card
+      this.monitor.group.position.set(w / 2 + 1.75, 0, 0.5);
+      this.monitor.group.rotation.y = -0.2;
+    };
+    this.layoutGantry();
+    this.gantry.visible = false;
+  }
+
+  /** the power unit's lamp: lit while the laser's firing */
+  private gantryLamp: THREE.Mesh | null = null;
+
+  /** set the gantry's parts to the card's size */
+  private layoutGantry = () => {};
+
+  /** Show the engraver over the card (making a ticket), or put it away. */
+  setGantry(on: boolean) {
+    this.gantryWanted = on;
+  }
+
+  /** the gantry: lowered in or lifted away, its beam and head running after the laser */
+  private updateGantry(dt: number, time: number) {
+    const goal = this.gantryWanted ? 1 : 0;
+    this.gantryK += THREE.MathUtils.clamp(goal - this.gantryK, -dt / GANTRY_ARRIVE, dt / GANTRY_ARRIVE);
+    this.gantry.visible = this.gantryK > 0;
+    if (!this.gantry.visible) return;
+    const k = this.gantryK;
+    const e = k < 0.5 ? 4 * k ** 3 : 1 - (-2 * k + 2) ** 3 / 2;
+    // floated down from above
+    this.gantry.position.y = (1 - e) * GANTRY_DROP;
+    this.monitor.update(time);
+    // the beam and head carry the laser: right over the spot it's cutting
+    this.headAt.copy(this.headGoal);
+    const { w, h } = this.size;
+    this.gantryBeam.position.y = (this.headAt.y - 0.5) * h;
+    this.gantryHead.position.x = (this.headAt.x - 0.5) * w;
   }
 
   /**
@@ -839,10 +1194,14 @@ export class MetalCard {
     this.laserU.uLaserOn.value = on ? 1 : 0;
     this.laser.visible = on && head.firing;
     this.laserLight.intensity = 0;
+    // the unit's lamp and the head's shield glow while it fires
+    const glow = this.gantryLamp?.material as THREE.MeshStandardMaterial | undefined;
+    if (glow) glow.emissiveIntensity = on && head.firing ? 1.6 : 0.25;
     if (!on) return;
     this.laserU.uLaserP.value = p;
     this.laserU.uLaserAspect.value = this.size.h / this.size.w;
     this.laserU.uLaserHead.value.set(head.u, head.v);
+    this.headGoal.set(head.u, head.v);
     this.laserU.uLaserFiring.value = head.firing ? 1 : 0;
     this.laser.position.set((head.u - 0.5) * this.size.w, (head.v - 0.5) * this.size.h, THICKNESS / 2 + FACE_LIFT + 0.0005);
     // it flickers as it cuts
@@ -853,6 +1212,7 @@ export class MetalCard {
 
   update(dt: number, time: number) {
     this.updateStack(dt);
+    this.updateGantry(dt, time);
     if (this.posed) {
       this.group.rotation.copy(this.posed);
       this.group.position.copy(this.posedAt);
@@ -865,9 +1225,11 @@ export class MetalCard {
       this.vel.x *= slow;
       this.vel.y *= slow;
       if (Math.hypot(this.vel.x, this.vel.y) < SETTLE_BELOW) {
-        // face-on again, front or back, whichever is nearer; and level
+        // face-on again, front or back, whichever is nearer (or the front, when
+        // it's been asked to come home); and level
         const ease = 1 - Math.exp(-SETTLE_RATE * dt);
-        this.rot.y += (Math.round(this.rot.y / Math.PI) * Math.PI - this.rot.y) * ease;
+        const step = this.homeFront ? 2 * Math.PI : Math.PI;
+        this.rot.y += (Math.round(this.rot.y / step) * step - this.rot.y) * ease;
         this.rot.x += (0 - this.rot.x) * ease;
       }
     }
@@ -876,15 +1238,97 @@ export class MetalCard {
     this.group.position.y = Math.sin(time * 0.9) * 0.04;
   }
 
+  /** Begin the opening: each plate's outline drawn in, then the plates over them. */
+  beginIntro() {
+    this.stack.beginIntro();
+  }
+
+  /** how far plate i has come in (0..1): 1 once it's in place with its ticket */
+  plateShown(i: number) {
+    return this.stack.plateShown(i);
+  }
+
+  /** Plates appear in place at once, without the opening or flying in (the cinematic reel). */
+  setInstantPlates(on: boolean) {
+    this.stack.setInstant(on);
+  }
+
+  /** the outline as a flat list of positions, for the fat lines */
+  private outlinePositions() {
+    return this.outlinePoints.flatMap((p) => [p.x, p.y, 0]);
+  }
+
+  /** the outlines' colour, the page's ink; their fill, a little of it over the page */
+  setOutlineInk(ink: THREE.Color, paper: THREE.Color) {
+    this.outlineInk.copy(ink);
+    this.outlineFill.copy(paper).lerp(ink, 0.07);
+    this.outlinePaper.copy(paper);
+    // and what a fading plate fades into
+    this.fadeU.uFadeBg.value.copy(paper);
+  }
+
+  /** each plate's outline, drawn as far as the opening has it, fading as the plate comes in over it */
+  private updateOutlines() {
+    // with Outlines on, every plate is drawn as its outline wherever it is, moves included
+    const only = !!this.stackParams.outlines;
+    const n = this.stack.collapsed ? 0 : only ? this.stackSlab.count : this.stackParams.count;
+    for (let i = 0; i < Math.max(n, this.introLines.length); i++) {
+      const drawn = i < n ? (only ? 1 : this.stack.outlineDrawn(i)) : 0;
+      const fade = drawn > 0 ? (only ? 1 : 1 - this.stack.plateShown(i)) : 0;
+      let line = this.introLines[i];
+      let fill = this.introFills[i];
+      if (fade <= 0.001) {
+        if (line) line.visible = false;
+        if (fill) fill.visible = false;
+        continue;
+      }
+      if (!fill) {
+        // fills write depth, so a plate's outline is hidden behind the fills in front of it
+        const mat = new THREE.MeshBasicMaterial({ transparent: true, toneMapped: false, side: THREE.DoubleSide, polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1 });
+        fill = this.introFills[i] = new THREE.Mesh(new THREE.ShapeGeometry(this.outlineShape!, CORNER_SEGMENTS), mat);
+        fill.matrixAutoUpdate = false;
+        fill.frustumCulled = false;
+        this.group.add(fill);
+      }
+      fill.visible = true;
+      if (only) this.stackSlab.getMatrixAt(i, fill.matrix);
+      else fill.matrix.copy(this.stack.restMatrix(i) ?? fill.matrix);
+      // a tint as the outline closes, easing back to the page before the plate comes
+      fill.material.color.copy(this.outlineFill).lerp(this.outlinePaper, only ? 1 : this.stack.outlineSettled(i));
+      fill.material.opacity = fade * THREE.MathUtils.smoothstep(drawn, 0.6, 1);
+      if (!line) {
+        // fat lines: WebGL draws plain lines one pixel wide whatever their width
+        const geo = new LineGeometry().setPositions(this.outlinePositions());
+        const mat = new LineMaterial({ transparent: true, depthWrite: false, toneMapped: false, linewidth: 1 });
+        line = this.introLines[i] = new Line2(geo, mat);
+        line.matrixAutoUpdate = false;
+        line.frustumCulled = false;
+        this.group.add(line);
+      }
+      line.visible = true;
+      line.matrix.copy(only ? fill.matrix : this.stack.restMatrix(i) ?? line.matrix);
+      // drawn as far as the opening has it, a segment at a time
+      line.geometry.instanceCount = Math.ceil(drawn * (this.outlinePoints.length - 1));
+      line.material.linewidth = this.stackParams.outlineWidth ?? 1;
+      line.material.color.copy(this.outlineInk);
+      line.material.opacity = fade;
+    }
+  }
+
   private updateStack(dt: number) {
     const { w, h } = this.size;
     // a pulled-out plate past the end of a shrunk stack goes back
     const f = this.stack.focused;
     if (f !== null && f >= this.stackParams.count) this.stack.setFocus(null);
     this.stack.update(dt, [this.stackSlab, this.stackFace], this.stackParams.count, w, h, THICKNESS, this.stackParams);
-    // settled on one card: draw the card itself
-    const single = this.stack.collapsed;
-    this.slab.visible = this.face.visible = single;
-    this.stackSlab.visible = this.stackFace.visible = !single;
+    this.updatePlateFade();
+    this.updateOutlines();
+    // folding to one card: the card itself rises in from below as the plates
+    // fly off, and once it's settled only the card is drawn
+    const arrival = this.stack.singleArrival;
+    this.slab.visible = this.face.visible = arrival > 0;
+    this.slab.position.y = this.face.position.y = -((1 - arrival) ** 2) * StackAnimator.FLY_OFF;
+    // outlines stand in for the plates (they still take hovers and clicks)
+    this.stackSlab.visible = this.stackFace.visible = !this.stack.collapsed && !this.stackParams.outlines;
   }
 }

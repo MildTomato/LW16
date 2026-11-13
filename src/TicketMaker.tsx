@@ -3,6 +3,7 @@ import {
   CAN_MAKE_TICKETS,
   USERNAME_MAX,
   cleanUsername,
+  designDraft,
   drawTicket,
   myTicket,
   nextTicketNumber,
@@ -13,6 +14,14 @@ import {
   type TicketDraft,
 } from './tickets.ts';
 import type { LaserStatus } from './scene.ts';
+import { logIn, onAccount, takePending, type Account } from './account.ts';
+import { ENGINE_SYSTEMS, randomDesignLayer, randomSeed, type DesignLayer } from './engineArt.ts';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+import { Button } from '@/components/ui/button';
+import { GripVertical, Plus, Shuffle, X } from 'lucide-react';
+
+/** the most layers a design can have */
+const MAX_LAYERS = 6;
 
 interface Props {
   /** making started or stopped: the card is the ticket meanwhile */
@@ -38,29 +47,63 @@ export function TicketMaker({ onOpen, laser, dark, onArt, onSaved }: Props) {
   const [draft, setDraft] = useState<TicketDraft>(() => randomDraft(''));
   const [busy, setBusy] = useState<'drawing' | 'saving' | null>(null);
   const [error, setError] = useState<string | null>(null);
+  /** the layer being dragged, and the row it's over */
+  const [dragging, setDragging] = useState<number | null>(null);
+  const [dragOver, setDragOver] = useState<number | null>(null);
   const artRef = useRef<DrawnTicket | null>(null);
   const drawJob = useRef(0);
+  /** a new artwork is waiting to be cut: a draw that replaces its draw (typing straight away) cuts it */
+  const etchPending = useRef(false);
   /** the number this ticket shows: yours, or the one it's about to get */
   const numberRef = useRef<number | undefined>(undefined);
 
-  // a browser that already made one starts from it
+  /** who's logged in (undefined until known) */
+  const [account, setAccount] = useState<Account | null | undefined>(undefined);
+
+  // follow the login: someone logged in starts from their ticket, if they've made one;
+  // someone back from logging in carries on with the ticket they were making
   useEffect(() => {
     if (!CAN_MAKE_TICKETS) return;
     let live = true;
-    myTicket().then((t) => {
-      if (!live || !t) return;
-      setMine(t);
-      mineRef.current = t;
-      numberRef.current = t.number;
-      setDraft({ username: t.username, engine: t.engine, seed: t.seed, layers: t.layers });
+    let lastId: string | null | undefined;
+    const pending = takePending<TicketDraft>();
+    if (pending) {
+      setDraft(pending);
+      draw(pending, true);
+      onOpen(true);
+      setOpen(true);
+    }
+    const stop = onAccount((a) => {
+      if (!live) return;
+      setAccount(a);
+      if (a?.id === lastId) return;
+      lastId = a?.id ?? null;
+      if (!a) {
+        setMine(null);
+        mineRef.current = null;
+        return;
+      }
+      myTicket().then((t) => {
+        if (!live) return;
+        setMine(t);
+        mineRef.current = t;
+        if (!t) {
+          if (a.suggested) setDraft((d) => (d.username ? d : { ...d, username: a.suggested }));
+          return;
+        }
+        numberRef.current = t.number;
+        if (!pending) setDraft({ username: t.username, engine: t.engine, seed: t.seed, layers: t.layers });
+      });
     });
     return () => {
       live = false;
+      stop();
     };
   }, []);
 
   const draw = (d: TicketDraft, etch: boolean) => {
     const job = ++drawJob.current;
+    if (etch) etchPending.current = true;
     setBusy('drawing');
     setError(null);
     // a frame first, so "Drawing…" shows before the engine takes the thread
@@ -73,7 +116,9 @@ export function TicketMaker({ onOpen, laser, dark, onArt, onSaved }: Props) {
         .then((drawn) => {
           if (job !== drawJob.current) return;
           artRef.current = drawn;
-          onArt(drawn, etch);
+          const cut = etchPending.current;
+          etchPending.current = false;
+          onArt(drawn, cut);
         })
         .catch((err) => job === drawJob.current && setError(String(err?.message ?? err)))
         .finally(() => job === drawJob.current && setBusy(null));
@@ -82,7 +127,8 @@ export function TicketMaker({ onOpen, laser, dark, onArt, onSaved }: Props) {
 
   /** a new artwork is cut fresh; a new username is only relettered */
   const change = (d: TicketDraft) => {
-    const etch = d.seed !== draft.seed || d.engine !== draft.engine || d.layers !== draft.layers;
+    const etch =
+      d.seed !== draft.seed || d.engine !== draft.engine || d.layers !== draft.layers || JSON.stringify(d.design) !== JSON.stringify(draft.design);
     setDraft(d);
     draw(d, etch);
   };
@@ -95,6 +141,7 @@ export function TicketMaker({ onOpen, laser, dark, onArt, onSaved }: Props) {
 
   const save = async () => {
     if (!artRef.current || !draft.username) return;
+    if (!account) return logIn(draft);
     setBusy('saving');
     setError(null);
     try {
@@ -113,21 +160,46 @@ export function TicketMaker({ onOpen, laser, dark, onArt, onSaved }: Props) {
   };
 
   if (!CAN_MAKE_TICKETS) return null;
-  const unchanged = !!mine && mine.username === draft.username && mine.seed === draft.seed && mine.engine === draft.engine && mine.layers === draft.layers;
-  const canPrint = busy === null && draft.username.length >= 2 && !!artRef.current && !unchanged;
+  const unchanged =
+    !!mine && mine.username === draft.username && mine.seed === draft.seed && mine.engine === draft.engine && mine.layers === draft.layers && !draft.design;
+  const canPrint = busy === null && account !== undefined && draft.username.length >= 2 && !!artRef.current && !unchanged;
   const remix = () => busy === null && change(randomDraft(draft.username));
+  // the design, layer by layer: an older ticket without one is shown as a fresh random design to start from
+  const design: DesignLayer[] = draft.design ?? [];
+  const setDesign = (next: DesignLayer[]) => change(designDraft(draft.username, next));
+  const setLayer = (i: number, layer: DesignLayer) => setDesign(design.map((l, k) => (k === i ? layer : l)));
+  /** a layer dragged from one place in the list to another (the first is the bottom of the stack) */
+  const moveLayer = (from: number, to: number) => {
+    if (from === to) return;
+    const next = [...design];
+    const [layer] = next.splice(from, 1);
+    next.splice(to, 0, layer);
+    setDesign(next);
+  };
   const ink = dark ? '#e8e6e1' : '#1a1a1a';
+  /** the buttons' colours: the page's ink, and a fill a shade off the page */
+  const pill = { '--ink': ink, '--paper': dark ? '#17201c' : '#f6f4f0' } as React.CSSProperties;
 
   if (!open) {
     return (
-      <button type="button" style={{ ...CALL_STYLE, color: ink }} onClick={toggle}>
+      <button
+        type="button"
+        className="pill"
+        style={{ ...CALL_STYLE, ...PILL_STYLE, ...pill }}
+        onClick={toggle}
+      >
         {mine ? `@${mine.username} #${pad(mine.number)} — remix yours →` : 'Make your ticket →'}
       </button>
     );
   }
 
-  // the laser's passes: each engine layer by name, then the lettering
-  const names = [...(artRef.current?.composition ?? []).map((l) => String((l as { gen?: string }).gen ?? 'layer')), 'lettering'];
+  // the laser's passes: the number and name first, then each engine layer by name
+  const names = [
+    'number',
+    'username',
+    ...(artRef.current?.design?.map((d) => d.system) ??
+      (artRef.current?.composition ?? []).map((l) => String((l as { gen?: string }).gen ?? 'layer'))),
+  ];
   const status = busy === 'drawing'
     ? 'Drawing'
     : busy === 'saving'
@@ -180,17 +252,102 @@ export function TicketMaker({ onOpen, laser, dark, onArt, onSaved }: Props) {
           />
         </label>
         <div style={KEYS_STYLE}>
-          <button type="button" style={{ ...KEY_STYLE, color: ink }} disabled={busy !== null} onClick={remix}>
-            [Space] Remix
+          <button type="button" className="pill" style={{ ...PILL_STYLE, ...pill }} onClick={toggle}>
+            Cancel <span style={KEY_HINT_STYLE}>Esc</span>
           </button>
-          <button type="button" style={{ ...KEY_STYLE, color: ink, opacity: canPrint ? 1 : 0.35 }} disabled={!canPrint} onClick={save}>
-            [↵] {mine ? 'Reprint yours' : 'Print to the stack'}
+          <button type="button" className="pill" style={{ ...PILL_STYLE, ...pill }} disabled={busy !== null} onClick={remix}>
+            Remix <span style={KEY_HINT_STYLE}>Space</span>
           </button>
-          <button type="button" style={{ ...KEY_STYLE, color: ink }} onClick={toggle}>
-            [Esc] Cancel
+          <button type="button" className="pill primary" style={{ ...PILL_STYLE, ...pill }} disabled={!canPrint} onClick={save}>
+            {!account ? 'Log in with Supabase to print' : mine ? 'Reprint yours' : 'Print to the stack'} <span style={KEY_HINT_STYLE}>↵</span>
           </button>
         </div>
         {error && <div style={ERROR_STYLE}>{error}</div>}
+      </div>
+      <div className={dark ? 'dark' : ''} style={{ ...LAYERS_STYLE, color: ink }} role="group" aria-label="Layers">
+        <div style={LAYERS_HEAD_STYLE}>
+          <span>Layers</span>
+          <span style={{ opacity: 0.45 }}>
+            {design.length}/{MAX_LAYERS}
+          </span>
+        </div>
+        {design.map((layer, i) => (
+          <div
+            key={`${layer.system}-${layer.seed}-${i}`}
+            draggable
+            onDragStart={(e) => {
+              setDragging(i);
+              e.dataTransfer.effectAllowed = 'move';
+              e.dataTransfer.setData('text/plain', String(i));
+            }}
+            onDragOver={(e) => {
+              if (dragging === null) return;
+              e.preventDefault();
+              e.dataTransfer.dropEffect = 'move';
+              if (dragOver !== i) setDragOver(i);
+            }}
+            onDrop={(e) => {
+              e.preventDefault();
+              if (dragging !== null) moveLayer(dragging, i);
+              setDragging(null);
+              setDragOver(null);
+            }}
+            onDragEnd={() => {
+              setDragging(null);
+              setDragOver(null);
+            }}
+            style={{
+              ...LAYER_ROW_STYLE,
+              opacity: dragging === i ? 0.4 : 1,
+              boxShadow: dragOver === i && dragging !== null && dragging !== i ? `0 ${dragging < i ? 1 : -1}px 0 0 ${ink}` : 'none',
+            }}
+          >
+            <GripVertical aria-hidden size={14} style={GRIP_STYLE} />
+            <span style={{ opacity: 0.45, fontVariantNumeric: 'tabular-nums' }}>{String(i + 1).padStart(2, '0')}</span>
+            <Select value={layer.system} onValueChange={(system) => setLayer(i, { system, seed: layer.seed })}>
+              <SelectTrigger size="sm" aria-label={`Layer ${i + 1} system`} className={`w-full min-w-0 ${dark ? 'dark' : ''}`}>
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent position="popper" className={dark ? 'dark' : ''}>
+                {Object.keys(ENGINE_SYSTEMS).map((name) => (
+                  <SelectItem key={name} value={name}>
+                    {name}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <Button
+              variant="outline"
+              size="icon-sm"
+              className="rounded-full border-foreground bg-transparent shadow-none"
+              title="Randomise this layer"
+              aria-label={`Randomise layer ${i + 1}`}
+              onClick={() => setLayer(i, { system: layer.system, seed: randomSeed() })}
+            >
+              <Shuffle />
+            </Button>
+            <Button
+              variant="outline"
+              size="icon-sm"
+              className="rounded-full border-foreground bg-transparent shadow-none"
+              title="Remove this layer"
+              aria-label={`Remove layer ${i + 1}`}
+              disabled={design.length <= 1}
+              onClick={() => setDesign(design.filter((_, k) => k !== i))}
+            >
+              <X />
+            </Button>
+          </div>
+        ))}
+        <Button
+          variant="outline"
+          size="sm"
+          className="justify-self-start rounded-full border-foreground bg-transparent font-mono text-[11px] tracking-[0.06em] uppercase shadow-none"
+          disabled={design.length >= MAX_LAYERS}
+          onClick={() => setDesign([...design, randomDesignLayer()])}
+        >
+          <Plus /> Add layer
+        </Button>
       </div>
     </>
   );
@@ -217,12 +374,58 @@ const CALL_STYLE: React.CSSProperties = {
   bottom: 28,
   transform: 'translateX(-50%)',
   zIndex: 10,
-  padding: '6px 4px',
-  border: 'none',
-  background: 'none',
-  font: `20px/1 ${PIXEL}`,
-  letterSpacing: '0.02em',
+};
+
+/** a rounded button in the console's type (its colours and states are the .pill class's) */
+const PILL_STYLE: React.CSSProperties = {
+  padding: '9px 16px',
+  border: '1px solid var(--ink)',
+  borderRadius: 999,
+  font: `11px/1 ${MONO}`,
+  letterSpacing: '0.06em',
+  textTransform: 'uppercase',
+  whiteSpace: 'nowrap',
   cursor: 'pointer',
+};
+
+/** the design's layers: a list to the right, under the monitor */
+const LAYERS_STYLE: React.CSSProperties = {
+  position: 'fixed',
+  right: 32,
+  bottom: 84,
+  zIndex: 10,
+  display: 'grid',
+  gap: 8,
+  width: 300,
+  font: `11px/1 ${MONO}`,
+  letterSpacing: '0.06em',
+  textTransform: 'uppercase',
+};
+
+const LAYERS_HEAD_STYLE: React.CSSProperties = {
+  display: 'flex',
+  justifyContent: 'space-between',
+  paddingBottom: 6,
+  borderBottom: '1px solid currentColor',
+};
+
+const LAYER_ROW_STYLE: React.CSSProperties = {
+  display: 'grid',
+  gridTemplateColumns: '14px 22px 1fr auto auto',
+  alignItems: 'center',
+  gap: 6,
+};
+
+/** the handle a layer's dragged by */
+const GRIP_STYLE: React.CSSProperties = {
+  cursor: 'grab',
+  opacity: 0.45,
+};
+
+/** a button's key, quieter beside its name */
+const KEY_HINT_STYLE: React.CSSProperties = {
+  marginLeft: 6,
+  opacity: 0.45,
 };
 
 const READOUT_STYLE: React.CSSProperties = {
@@ -278,17 +481,7 @@ const INPUT_STYLE: React.CSSProperties = {
 
 const KEYS_STYLE: React.CSSProperties = {
   display: 'flex',
-  gap: 24,
-};
-
-const KEY_STYLE: React.CSSProperties = {
-  border: 'none',
-  background: 'none',
-  padding: 0,
-  font: `11px/1 ${MONO}`,
-  letterSpacing: '0.06em',
-  textTransform: 'uppercase',
-  cursor: 'pointer',
+  gap: 8,
 };
 
 const ERROR_STYLE: React.CSSProperties = {

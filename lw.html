@@ -1,0 +1,295 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Launch Week 16 | Supabase</title>
+    <!--
+      A mock of supabase.com/launch-week for LW16, laid out like the LW15 page
+      (a 1088px column, the same sections and type scale), with Geist standing
+      in for Suisse and Manrope. The hero is the live ticket stack, embedded
+      small, on its side; clicking it opens the full site in place.
+    -->
+    <style>
+      @font-face { font-family: 'Geist'; src: url('/fonts/Geist-Regular.woff2') format('woff2'); font-weight: 400; font-display: swap; }
+      @font-face { font-family: 'Geist'; src: url('/fonts/Geist-Medium.woff2') format('woff2'); font-weight: 500 600; font-display: swap; }
+      @font-face { font-family: 'Geist Mono'; src: url('/fonts/GeistMono-Regular.woff2') format('woff2'); font-display: swap; }
+      @font-face { font-family: 'Geist Pixel Square'; src: url('/fonts/GeistPixel-Square.woff2') format('woff2'); font-display: swap; }
+
+      /* the stack's own rooms, so the page and the hero are one ground */
+      html[data-theme='light'] { --bg: #f3f2ed; --ink: #161616; --mid: #6e6d69; --soft: #8f8d88; --line: rgba(22, 22, 22, 0.12); --nav: rgba(243, 242, 237, 0.85); }
+      html[data-theme='dark'] { --bg: #000805; --ink: #ededea; --mid: #9a9b97; --soft: #6f716d; --line: rgba(237, 237, 234, 0.12); --nav: rgba(0, 8, 5, 0.85); }
+      * { box-sizing: border-box; }
+      html, body { margin: 0; background: var(--bg); color: var(--ink); }
+      body { font: 400 16px/1.5 'Geist', system-ui, sans-serif; -webkit-font-smoothing: antialiased; transition: background 0.3s, color 0.3s; }
+      body.locked { overflow: hidden; }
+      a { color: inherit; text-decoration: none; }
+      button { font: inherit; color: inherit; background: none; border: 0; padding: 0; cursor: pointer; }
+      .wrap { max-width: 1088px; margin: 0 auto; padding: 0 24px; box-sizing: content-box; }
+
+      /* nav: as supabase.com's */
+      nav { position: sticky; top: 0; z-index: 5; height: 64px; background: var(--nav); backdrop-filter: blur(8px); border-bottom: 1px solid var(--line); }
+      nav .wrap { height: 100%; display: flex; align-items: center; gap: 28px; font-size: 13px; }
+      .logo { display: flex; align-items: center; gap: 8px; font-weight: 600; font-size: 18px; letter-spacing: -0.02em; margin-right: 12px; }
+      .logo svg { width: 20px; height: 20px; }
+      nav .links { display: flex; gap: 22px; color: var(--mid); }
+      nav .right { margin-left: auto; display: flex; gap: 10px; align-items: center; }
+      .btn { height: 28px; padding: 0 10px; border-radius: 6px; font-size: 12px; display: inline-flex; align-items: center; border: 1px solid var(--line); }
+      .btn.green { background: #3ecf8e; border-color: #3ecf8e; color: #0b2b1c; }
+
+      /* the strap above the hero */
+      .strap { display: flex; justify-content: space-between; font-size: 12px; line-height: 16px; padding-top: 40px; }
+      .strap .modes { display: flex; gap: 6px; color: var(--soft); }
+      .strap .modes button[aria-pressed='true'] { color: var(--ink); }
+
+      /* the hero: LW and 16 at the column's edges as on LW15, the stack between them */
+      .hero { position: relative; height: 300px; margin: 32px 0 28px; display: flex; align-items: center; justify-content: space-between; }
+      .hero .t { font: 88px/1 'Geist Pixel Square', monospace; letter-spacing: -0.02em; position: relative; z-index: 2; transition: opacity 0.3s; pointer-events: none; }
+      body.locked .hero .t { opacity: 0; }
+      .slot { position: absolute; inset: 0; }
+      .stage { position: absolute; inset: 0; z-index: 1; }
+      .stage iframe { width: 100%; height: 100%; border: 0; display: block; background: var(--bg); opacity: 0; transition: opacity 0.6s; }
+      .stage.ready iframe { opacity: 1; }
+      /* small in the page, its edges melt into the page's ground */
+      .stage:not(.open) iframe { mask-image: linear-gradient(to right, transparent, #000 3%, #000 97%, transparent), linear-gradient(to bottom, transparent, #000 14%, #000 86%, transparent); mask-composite: intersect; }
+      .stage.open { position: fixed; z-index: 20; }
+      /* on opening, the page fades out behind the stack before it grows */
+      .veil { position: fixed; inset: 0; z-index: 19; background: var(--bg); opacity: 0; pointer-events: none; transition: opacity 180ms ease-out; }
+      .veil.on { opacity: 1; pointer-events: auto; }
+      /* coming back, the page settles in more slowly than it left */
+      .veil.back { transition-duration: 600ms; transition-timing-function: ease-in-out; }
+      body.back .hero .t { transition-duration: 600ms; }
+      .hero .open-hint { position: absolute; right: 0; bottom: -4px; z-index: 2; font: 11px/1 'Geist Mono', monospace; letter-spacing: 0.04em; text-transform: uppercase; color: var(--mid); pointer-events: none; }
+      .close { position: fixed; top: 20px; left: 24px; z-index: 21; height: 30px; padding: 0 14px; border-radius: 999px; border: 1px solid var(--ink); background: var(--bg); font: 11px/1 'Geist Mono', monospace; letter-spacing: 0.04em; text-transform: uppercase; display: none; }
+      .close.on { display: inline-flex; align-items: center; gap: 8px; }
+
+      h3 { font-weight: 600; font-size: 28px; line-height: 1.2; letter-spacing: -0.01em; margin: 0; }
+      section { padding: 40px 0; }
+
+      /* Main Stage: five days */
+      .days { display: grid; grid-template-columns: repeat(5, 1fr); gap: 4px; }
+      .day { position: relative; height: 296px; border: 1px solid var(--line); border-radius: 4px; padding: 16px; display: flex; flex-direction: column; justify-content: flex-end; overflow: hidden; }
+      .day .outline { position: absolute; left: 50%; top: 38%; width: 64px; height: 96px; translate: -50% -50%; border: 1px solid var(--line); border-radius: 4px; rotate: var(--r); }
+      .day .when { color: var(--mid); font-size: 16px; }
+      .day h4 { font-weight: 600; font-size: 18px; line-height: 1.375; margin: 6px 0 0; }
+      .day .tag { position: absolute; top: 14px; left: 16px; font: 11px/1 'Geist Mono', monospace; letter-spacing: 0.04em; text-transform: uppercase; color: var(--soft); }
+
+      /* Build Stage: a list beside its title */
+      .build { display: grid; grid-template-columns: 430px 1fr; gap: 46px; }
+      .build .side { display: flex; flex-direction: column; justify-content: flex-end; }
+      .build .side p { font-size: 12px; line-height: 16px; margin: 0; max-width: 140px; }
+      .build ul { list-style: none; margin: 0; padding: 0; border-top: 1px solid var(--line); }
+      .build li { height: 58px; display: flex; align-items: center; gap: 14px; border-bottom: 1px solid var(--line); color: var(--soft); }
+      .build li::before { content: ''; width: 5px; height: 5px; background: currentColor; }
+
+      /* Hackathon */
+      .hack { display: grid; grid-template-columns: 1fr 1fr; gap: 46px; padding: 120px 0; }
+      .hack .art { aspect-ratio: 1.1; border: 1px solid var(--line); border-radius: 4px; overflow: hidden; }
+      .hack .art img { width: 100%; height: 100%; object-fit: cover; object-position: 44% 50%; mix-blend-mode: multiply; filter: grayscale(1) contrast(1.3); }
+      html[data-theme='dark'] .hack .art img { mix-blend-mode: screen; filter: grayscale(1) invert(1) contrast(1.3); }
+      .big { font-size: 58px; line-height: 1; letter-spacing: -0.02em; }
+      .big .dim { color: var(--mid); display: block; }
+      .hack p { font-size: 22px; line-height: 1.33; color: var(--mid); max-width: 350px; margin: 210px 0 18px; }
+      .pill { display: inline-flex; align-items: center; height: 32px; padding: 0 14px; border-radius: 6px; background: var(--ink); color: var(--bg); font-size: 14px; font-weight: 500; }
+
+      /* Meetups */
+      .meet p.lede { font-size: 14px; color: var(--mid); margin: 6px 0 56px; }
+      .cities { font-size: 46px; line-height: 50px; letter-spacing: -0.02em; }
+      .cities a { color: var(--soft); transition: color 0.15s; }
+      .cities a:hover { color: var(--ink); }
+      .cities .sep { color: var(--soft); opacity: 0.5; margin: 0 12px; }
+
+      footer { border-top: 1px solid var(--line); margin-top: 80px; padding: 32px 0 64px; font-size: 12px; color: var(--mid); }
+      footer .wrap { display: flex; justify-content: space-between; }
+    </style>
+  </head>
+  <body>
+
+    <main>
+      <div class="wrap">
+        <div class="strap">
+          <span>Five days of launches. Make your ticket and join the stack.</span>
+          <span class="modes"><button data-mode="dark">dark mode</button>/<button data-mode="light">light mode</button></span>
+        </div>
+
+        <div class="hero">
+          <span class="t">LW</span>
+          <div class="slot" id="slot">
+            <div class="stage" id="stage">
+              <iframe id="stack" title="The Launch Week 16 tickets" src="/?embed&zoom=1.6&stack.axis=Sideways&stack.spacing=4&render.noise=0&theme=Light"></iframe>
+            </div>
+          </div>
+          <span class="t">16</span>
+          <span class="open-hint">Click the stack to make your ticket →</span>
+        </div>
+      </div>
+
+      <section>
+        <div class="wrap">
+          <div class="days">
+            <div class="day" style="--r: -6deg"><span class="tag">Day 1</span><span class="outline"></span><span class="when">Monday</span><h4>To be announced</h4></div>
+            <div class="day" style="--r: 4deg"><span class="tag">Day 2</span><span class="outline"></span><span class="when">Tuesday</span><h4>To be announced</h4></div>
+            <div class="day" style="--r: -2deg"><span class="tag">Day 3</span><span class="outline"></span><span class="when">Wednesday</span><h4>To be announced</h4></div>
+            <div class="day" style="--r: 7deg"><span class="tag">Day 4</span><span class="outline"></span><span class="when">Thursday</span><h4>To be announced</h4></div>
+            <div class="day" style="--r: -4deg"><span class="tag">Day 5</span><span class="outline"></span><span class="when">Friday</span><h4>To be announced</h4></div>
+          </div>
+        </div>
+      </section>
+
+      <section>
+        <div class="wrap build">
+          <div class="side"><p>A collection of surprise releases.</p></div>
+          <ul>
+            <li>Revealed during the week</li>
+            <li>Revealed during the week</li>
+            <li>Revealed during the week</li>
+            <li>Revealed during the week</li>
+            <li>Revealed during the week</li>
+            <li>Revealed during the week</li>
+          </ul>
+        </div>
+      </section>
+
+      <div class="wrap hack">
+        <div class="art"><img src="/og.jpg" alt="" /></div>
+        <div>
+          <div class="big"><span class="dim">Hackathon</span>Starts this Friday.</div>
+          <p>Build something amazing in 10 days using Supabase. Compete solo or in a team, submit a quick demo and win.</p>
+          <a class="pill" href="#">Join Hackathon</a>
+        </div>
+      </div>
+
+      <section class="meet">
+        <div class="wrap">
+          <h3>LW16 Worldwide Meetups</h3>
+          <p class="lede">Join us for community-driven meetups around the world to celebrate Launch Week 16.</p>
+          <div class="cities" id="cities"></div>
+        </div>
+      </section>
+    </main>
+
+    <footer><div class="wrap"><span>© Supabase Inc</span><span>Launch Week 16</span></div></footer>
+
+    <div class="veil" id="veil"></div>
+    <button class="close" id="close">← Back to Launch Week</button>
+
+    <script>
+      const cities = ['Amsterdam', 'Austin', 'Bangkok', 'Berlin', 'Buenos Aires', 'Lagos', 'Lisboa', 'London', 'Nairobi', 'New York', 'San Francisco', 'São Paulo', 'Seoul', 'Singapore', 'Sydney', 'Tokyo', 'Toronto'];
+      document.getElementById('cities').innerHTML = cities.map((c) => `<a href="#">${c}</a>`).join('<span class="sep">/</span>');
+
+      const frame = document.getElementById('stack');
+      const stage = document.getElementById('stage');
+      const hero = document.getElementById('slot');
+      const close = document.getElementById('close');
+      const tell = (msg) => frame.contentWindow?.postMessage(msg, location.origin);
+      const MS = 700;
+
+      // Opening: the page fades out, then the 3D frame goes to the whole window
+      // at once, still showing the stack where it was in the hero, and the view
+      // eases out from there to fill the window: the cards come forward inside
+      // the full window, never clipped by a growing frame. Closing runs it back.
+      const FADE = 180;
+      const veil = document.getElementById('veil');
+      const ease = (t) => (t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2);
+      const rect = (r) => ({ x: r.left ?? r.x, y: r.top ?? r.y, w: r.width ?? r.w, h: r.height ?? r.h });
+      const full = () => ({ x: 0, y: 0, w: innerWidth, h: innerHeight });
+      // in the hero the scene's drawn ZOOM times closer: as a frame, the hero grown about its middle
+      const ZOOM = Number(new URL(frame.src).searchParams.get('zoom')) || 1;
+      const heroFrame = () => {
+        const r = rect(hero.getBoundingClientRect());
+        return { x: r.x - (r.w * (ZOOM - 1)) / 2, y: r.y - (r.h * (ZOOM - 1)) / 2, w: r.w * ZOOM, h: r.h * ZOOM };
+      };
+      const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+      function sweep(from, to) {
+        return new Promise((done) => {
+          const t0 = performance.now();
+          const step = (now) => {
+            const k = ease(Math.min(1, (now - t0) / MS));
+            const lerp = (a, b) => a + (b - a) * k;
+            tell({ lw16: 'frame', value: { x: lerp(from.x, to.x), y: lerp(from.y, to.y), w: lerp(from.w, to.w), h: lerp(from.h, to.h) } });
+            if (k < 1) requestAnimationFrame(step); else done();
+          };
+          requestAnimationFrame(step);
+        });
+      }
+      let busy = false;
+      async function open() {
+        if (busy || stage.classList.contains('open')) return;
+        busy = true;
+        const from = heroFrame();
+        veil.classList.add('on');
+        document.body.classList.add('locked');
+        await wait(FADE);
+        // the scene learns its frame while still that size (no change), then the frame fills the window
+        tell({ lw16: 'frame', value: from });
+        await wait(50);
+        stage.classList.add('open');
+        Object.assign(stage.style, { top: '0', left: '0', width: '100vw', height: '100vh' });
+        tell({ lw16: 'open' });
+        await sweep(from, full());
+        tell({ lw16: 'frame', value: null });
+        close.classList.add('on');
+        busy = false;
+      }
+      async function shut() {
+        if (busy || !stage.classList.contains('open')) return;
+        busy = true;
+        close.classList.remove('on');
+        tell({ lw16: 'closing' });
+        // the cards shrink back to their place in the hero as they are
+        const to = heroFrame();
+        await sweep(full(), to);
+        // back in place, the page settles in round them
+        tell({ lw16: 'close' });
+        stage.classList.remove('open');
+        stage.style.cssText = '';
+        await wait(80);
+        tell({ lw16: 'frame', value: null });
+        veil.classList.add('back');
+        document.body.classList.add('back');
+        veil.classList.remove('on');
+        document.body.classList.remove('locked');
+        await wait(600);
+        veil.classList.remove('back');
+        document.body.classList.remove('back');
+        busy = false;
+      }
+      close.addEventListener('click', shut);
+      addEventListener('keydown', (e) => e.key === 'Escape' && shut());
+
+      // the page and the stack share a room
+      function setMode(mode) {
+        document.documentElement.dataset.theme = mode;
+        document.querySelectorAll('.modes button').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.mode === mode)));
+        tell({ lw16: 'theme', value: mode === 'dark' ? 'Dark' : 'Light' });
+      }
+      document.querySelectorAll('.modes button').forEach((b) => b.addEventListener('click', () => setMode(b.dataset.mode)));
+      setMode('light');
+      frame.addEventListener('load', () => setMode(document.documentElement.dataset.theme));
+
+      // the stack stays hidden until its scene has drawn, then fades in: no loading flash
+      addEventListener('message', (e) => {
+        if (e.origin !== location.origin || e.source !== frame.contentWindow) return;
+        // drawn, then fitted to the gap: only then is it shown
+        if (e.data?.lw16 === 'ready') { fit(); setTimeout(() => stage.classList.add('ready'), 4000); }
+        if (e.data?.lw16 === 'fitted') stage.classList.add('ready');
+        // a click on the stack (not a drag to spin it) opens it
+        if (e.data?.lw16 === 'tap') open();
+        // the stack hands back what's the page's: its wheel scrolls the page, Esc closes it
+        if (e.data?.lw16 === 'wheel') scrollBy(e.data.mode === 1 ? e.data.dx * 16 : e.data.dx, e.data.mode === 1 ? e.data.dy * 16 : e.data.dy);
+        if (e.data?.lw16 === 'escape') shut();
+      });
+
+      // the helix starts just after LW and ends just before 16: the stack spans
+      // the whole hero, so nothing's clipped, and the scene stretches it to the gap
+      const [lw, sixteen] = document.querySelectorAll('.hero .t');
+      const REACH = 36;
+      function fit() {
+        const a = lw.getBoundingClientRect(), b = sixteen.getBoundingClientRect();
+        tell({ lw16: 'fit', value: b.left - a.right - REACH * 2 });
+      }
+      addEventListener('resize', () => { if (!stage.classList.contains('open')) fit(); });
+      document.fonts.ready.then(fit);
+    </script>
+  </body>
+</html>

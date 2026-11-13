@@ -1,0 +1,105 @@
+<!doctype html>
+<!--
+  A shared ticket's card (1200x630): the ticket upright on the page, LW
+  overlapping its left edge and 16 tucked under its right, as on the site.
+  The ticket is built the way the site lays it: green metal, the stored
+  linework (the bucket's webp) etched over it, the margin marks, and the
+  owner die-cut through, so the page shows through the letters.
+  ?t=<ticket webp in tickets/>&u=<username>&n=<number>&theme=light|dark
+  Everything here is plain SVG + two fonts, so a server (Satori/resvg) can
+  draw the same thing per ticket.
+-->
+<html>
+<head>
+<meta charset="utf-8" />
+<style>
+  @font-face { font-family: 'Geist Mono'; src: url('../public/fonts/GeistMono-Regular.woff2') format('woff2'); }
+  @font-face { font-family: 'Geist Pixel Square'; src: url('../public/fonts/GeistPixel-Square.woff2') format('woff2'); }
+  @font-face { font-family: 'Geist Pixel Line'; src: url('../public/fonts/GeistPixel-Line.woff2') format('woff2'); }
+  html, body { margin: 0; width: 1200px; height: 630px; overflow: hidden; }
+  .frame { position: relative; width: 1200px; height: 630px; background: var(--paper); }
+  .light { --paper: #e8e6e1; --ink: #161616; --metal: #45e09c; --metal-hi: #7af0bd; --etch: #0d5a36; --shadow: rgba(40, 40, 30, 0.22); }
+  .dark { --paper: #0c110f; --ink: #ecebe6; --metal: #3fd892; --metal-hi: #82f2c2; --etch: #0b4a2c; --shadow: rgba(0, 0, 0, 0.6); }
+  svg.ticket { position: absolute; left: 434px; top: 65px; width: 333px; height: 500px; filter: drop-shadow(0 18px 22px var(--shadow)) drop-shadow(0 2px 3px var(--shadow)); }
+  .title {
+    position: absolute; top: 262px; font: 112px/1 'Geist Pixel Square'; color: var(--ink);
+    letter-spacing: 0; opacity: 0.94;
+  }
+  /* LW in front, overlapping the card's left edge; 16 behind, under its right */
+  .lw { right: calc(1200px - 434px - 64px); z-index: 2; }
+  .sixteen { left: calc(767px - 12px); z-index: 0; }
+  svg.ticket { z-index: 1; }
+  .label {
+    position: absolute; font: 13px/1 'Geist Mono', monospace; letter-spacing: 0.08em;
+    text-transform: uppercase; color: var(--ink); opacity: 0.82; z-index: 3;
+  }
+  .tl { top: 40px; left: 48px; }
+  .tr { top: 40px; right: 48px; }
+  .br { bottom: 40px; right: 48px; }
+  /* printed, not lit: a fine grain over everything, the way the site's paper has it */
+  .grain { position: absolute; inset: 0; z-index: 4; pointer-events: none; mix-blend-mode: multiply; opacity: 0.55; }
+  .dark .grain { mix-blend-mode: screen; opacity: 0.22; }
+</style>
+</head>
+<body>
+  <div class="frame" id="frame">
+    <div class="title lw">LW</div>
+    <div class="title sixteen">16</div>
+    <svg class="ticket" viewBox="0 0 2000 3000" xmlns="http://www.w3.org/2000/svg">
+      <defs>
+        <linearGradient id="sheen" x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0" style="stop-color:var(--metal-hi)" />
+          <stop offset="0.45" style="stop-color:var(--metal)" />
+          <stop offset="1" style="stop-color:var(--metal)" />
+        </linearGradient>
+        <!-- the owner, cut through the card -->
+        <mask id="cut" maskUnits="userSpaceOnUse" x="0" y="0" width="2000" height="3000">
+          <rect width="2000" height="3000" rx="40" fill="#fff" />
+          <g id="owner" fill="#000" font-family="'Geist Pixel Line'"></g>
+        </mask>
+        <!-- the stored linework is dark strokes on clear ground: recolour it to the etch -->
+        <filter id="etch" color-interpolation-filters="sRGB">
+          <feColorMatrix type="matrix" id="etchMatrix" values="0 0 0 0 0.05  0 0 0 0 0.35  0 0 0 0 0.21  0 0 0 0.92 0" />
+        </filter>
+      </defs>
+      <g mask="url(#cut)">
+        <rect width="2000" height="3000" rx="40" fill="url(#sheen)" />
+        <image id="ink" x="0" y="0" width="2000" height="3000" filter="url(#etch)" />
+        <g style="fill:var(--etch)" font-family="Helvetica Neue, Helvetica, Arial, sans-serif" font-size="44" font-weight="300" letter-spacing="0.5">
+          <text x="100" y="132">Petabyte</text>
+          <text x="100" y="2900">Prototype</text>
+        </g>
+        <line x1="100" y1="176" x2="100" y2="2826" style="stroke:var(--etch)" stroke-width="2" />
+      </g>
+    </svg>
+    <div class="label tl">Supabase</div>
+    <div class="label tr" id="number"></div>
+    <div class="label br">Make your ticket &rarr;</div>
+    <svg class="grain" width="1200" height="630">
+      <filter id="noise"><feTurbulence type="fractalNoise" baseFrequency="0.9" numOctaves="2" seed="7" /><feColorMatrix type="saturate" values="0" /><feComponentTransfer><feFuncA type="table" tableValues="0 0.5" /></feComponentTransfer></filter>
+      <rect width="1200" height="630" filter="url(#noise)" />
+    </svg>
+  </div>
+  <script>
+    const q = new URLSearchParams(location.search);
+    const frame = document.getElementById('frame');
+    frame.classList.add(q.get('theme') === 'dark' ? 'dark' : 'light');
+    const u = q.get('u') || 'dev_sam';
+    const n = Number(q.get('n') || 13);
+    document.getElementById('ink').setAttribute('href', `tickets/${q.get('t') || u}.webp`);
+    document.getElementById('number').textContent = `Ticket #${String(n).padStart(4, '0')}`;
+
+    // ownerPage in src/gridArt.ts: up the right edge from the bottom corner,
+    // the name a line in and the number nearest the edge
+    const W = 2000, RULE_X = 100, RULE_BOTTOM = 2826;
+    const name = `@${u}`, number = `#${String(n).padStart(4, '0')}`;
+    const reach = RULE_BOTTOM - 176 - 40;
+    const size = Math.min(420, Math.floor(reach / (0.62 * Math.max(name.length, number.length))));
+    const line = Math.round(size * 1.05);
+    const at = (x, text) => `<text transform="translate(${x} ${RULE_BOTTOM}) rotate(-90)">${text}</text>`;
+    const owner = document.getElementById('owner');
+    owner.setAttribute('font-size', size);
+    owner.innerHTML = at(W - RULE_X - line, name) + at(W - RULE_X, number);
+  </script>
+</body>
+</html>

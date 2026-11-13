@@ -19,6 +19,7 @@ export const ENGINE_SYSTEMS: Record<string, string | { gen: string; params: Reco
   'Circle Wireframe': { gen: 'stacks', params: { ...WIRE, mode: 'circle' } },
   'Stack Wireframe': { gen: 'stacks', params: { ...WIRE, mode: 'stack' } },
   'Pyramid Wireframe': { gen: 'stacks', params: { ...WIRE, mode: 'pyramid' } },
+  'Wireframes': 'wireframes',
   'Stacks': 'stacks',
   'Radial Burst': 'radial',
   'Abstract Diagrams': 'diagrams',
@@ -84,31 +85,62 @@ const layerFor = (engine: EngineModule, name: string) => {
 async function randomLayers(engine: EngineModule, seed: number, count: number) {
   const { randomizeLayer } = (await Object.values(RANDOMIZE)[0]()) as RandomizeModule;
   const r = rng(seed);
-  const names = Object.keys(ENGINE_SYSTEMS).filter((n) => !HEAVY.has(n));
-  const clips = ['circle', 'ellipse', 'rect', 'triangle'];
   const layers: EngineLayer[] = [];
   for (let i = 0; i < count; i++) {
-    let layer = layerFor(engine, names[Math.floor(r() * names.length)]);
+    const name = DESIGN_SYSTEMS[Math.floor(r() * DESIGN_SYSTEMS.length)];
     // Explore: bigger jumps in geometry, density and distribution; colour kept
-    layer = randomizeLayer(layer, 'explore', Math.floor(r() * 1e9));
-    if (i > 0) {
-      layer.tf = {
-        x: Math.round((r() - 0.5) * 30) / 100,
-        y: Math.round((r() - 0.5) * 40) / 100,
-        scale: Math.round((0.45 + r() * 0.7) * 100) / 100,
-        rot: r() < 0.5 ? 0 : Math.round((r() - 0.5) * 90),
-      };
-      layer.opacity = Math.round((0.55 + r() * 0.45) * 100) / 100;
-      if (r() < 0.4) {
-        layer.clip = {
-          mode: clips[Math.floor(r() * clips.length)],
-          x: 0.3 + r() * 0.4, y: 0.3 + r() * 0.4, w: 0.35 + r() * 0.45, h: 0.35 + r() * 0.45, rot: Math.round(r() * 90),
-        };
-      }
-    }
-    layers.push(layer);
+    layers.push(placeLayer(randomizeLayer(layerFor(engine, name), 'explore', Math.floor(r() * 1e9)), i, r));
   }
   return layers;
+}
+
+/**
+ * Where a layer over the first sits: moved, scaled and turned, sometimes
+ * clipped to a shape, and a little lighter (the first fills the page).
+ */
+function placeLayer(layer: EngineLayer, i: number, r: () => number) {
+  if (i === 0) return layer;
+  const clips = ['circle', 'ellipse', 'rect', 'triangle'];
+  layer.tf = {
+    x: Math.round((r() - 0.5) * 30) / 100,
+    y: Math.round((r() - 0.5) * 40) / 100,
+    scale: Math.round((0.45 + r() * 0.7) * 100) / 100,
+    rot: r() < 0.5 ? 0 : Math.round((r() - 0.5) * 90),
+  };
+  layer.opacity = Math.round((0.55 + r() * 0.45) * 100) / 100;
+  if (r() < 0.4) {
+    layer.clip = {
+      mode: clips[Math.floor(r() * clips.length)],
+      x: 0.3 + r() * 0.4, y: 0.3 + r() * 0.4, w: 0.35 + r() * 0.45, h: 0.35 + r() * 0.45, rot: Math.round(r() * 90),
+    };
+  }
+  return layer;
+}
+
+/** the systems a design picks from at random: the linework ones (the heavy masses can still be chosen) */
+export const DESIGN_SYSTEMS = Object.keys(ENGINE_SYSTEMS).filter((n) => !HEAVY.has(n));
+
+/** a layer of a ticket's design: which of the engine's systems, and the seed that explores its settings and placement */
+export interface DesignLayer {
+  system: string;
+  seed: number;
+}
+
+export const randomSeed = () => 1 + Math.floor(Math.random() * 999999);
+
+/** a layer of a random system */
+export const randomDesignLayer = (): DesignLayer => ({
+  system: DESIGN_SYSTEMS[Math.floor(Math.random() * DESIGN_SYSTEMS.length)],
+  seed: randomSeed(),
+});
+
+/** a design's layers, as the engine's: each its system, explored and placed by its own seed */
+async function designLayers(engine: EngineModule, design: DesignLayer[]) {
+  const { randomizeLayer } = (await Object.values(RANDOMIZE)[0]()) as RandomizeModule;
+  return design.map((d, i) => {
+    const r = rng(d.seed);
+    return placeLayer(randomizeLayer(layerFor(engine, d.system), 'explore', Math.floor(r() * 1e9)), i, r);
+  });
 }
 
 /**
@@ -143,12 +175,16 @@ export async function engineStages(
   seed: number,
   box: { x: number; y: number; w: number; h: number },
   count = 3,
-): Promise<{ stages: string[]; layers: unknown[] }> {
+  /** a design of its own: these layers, in order (system is then ignored) */
+  design?: DesignLayer[],
+): Promise<{ stages: string[]; singles: string[]; layers: unknown[] }> {
   const load = Object.values(ENGINE)[0];
   if (!load) throw new Error('the Visual Engine submodule is not checked out');
   const engine = (await load()) as EngineModule;
   let layers: EngineLayer[];
-  if (system === ENGINE_RANDOM) {
+  if (design?.length) {
+    layers = await designLayers(engine, design);
+  } else if (system === ENGINE_RANDOM) {
     layers = await randomLayers(engine, seed, count);
   } else {
     const layer = layerFor(engine, system);
@@ -156,12 +192,13 @@ export async function engineStages(
     layers = [layer];
   }
   const cw = Math.round(box.w * DRAW_SCALE), ch = Math.round(box.h * DRAW_SCALE);
-  const stages = layers.map((_, k) => {
+  // the page's linework for some of the layers: the first k + 1 (a stage), or one alone
+  const linework = (some: EngineLayer[]) => {
     const svg = engine.compositionSvg({
       version: 1,
       name: 'Card',
       canvas: { w: cw, h: ch, ratio: 'custom', bg: '#000000', transparent: true, resizeMode: 'recompose' },
-      layers: layers.slice(0, k + 1),
+      layers: some,
       active: null,
     }, { transparent: true, frame: false, tick: 0 });
     const inner = svg.slice(svg.indexOf('>') + 1, svg.lastIndexOf('</svg>'));
@@ -173,7 +210,10 @@ export async function engineStages(
   <g filter="url(#engine-ink)" fill="#000" stroke="none" stroke-width="1">
     <svg x="${box.x}" y="${box.y}" width="${box.w}" height="${box.h}" viewBox="0 0 ${cw} ${ch}">${inner}</svg>
   </g>`;
-  });
+  };
+  const stages = layers.map((_, k) => linework(layers.slice(0, k + 1)));
+  // and each layer on its own, where it sits on the page
+  const singles = layers.map((l) => linework([l]));
   // the layers themselves, as plain data: what a ticket keeps of its artwork
-  return { stages, layers: JSON.parse(JSON.stringify(layers)) as unknown[] };
+  return { stages, singles, layers: JSON.parse(JSON.stringify(layers)) as unknown[] };
 }
